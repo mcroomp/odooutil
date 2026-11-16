@@ -4,11 +4,12 @@ Python helpers for working with Odoo. Both packages ship as `odooutil`:
 
 | Package | Responsibility |
 | --- | --- |
-| [odoobase](odoobase/) | Typed records, relation validation and XML-RPC/JSON-RPC |
+| [odoobase](odoobase/) | Typed records, relation validation, RPC and a testing transport |
 | [odooutil](odooutil/) | Queries, schema and record changes, and financial reports |
 
 The packages work with live Odoo data, without local caches or snapshots.
-Importing them does not open a connection.
+`odoobase.testing` supplies a configurable in-memory fake for offline tests.
+Importing the packages does not open a connection.
 
 ## Development
 

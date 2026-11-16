@@ -8,6 +8,7 @@ Requires Python 3.14.10+ and Pydantic 2. Development uses uv and pins Python 3.1
   and budget TypedDicts with standard fields only.
 - `odoobase.relations`: strict Many2one parsing and reference-integrity checks.
 - `odoobase.rpc`: typed RPC client and common operational validation helpers.
+- `odoobase.testing`: stateful, schema-configurable fake RPC transport.
 
 ```python
 from odoobase import get_odoo_models
@@ -47,3 +48,59 @@ references in a supplied index.
 The library does not configure logging handlers, hold a global connection,
 cache records or manage application files. Native `x_*` schemas, model-fetch
 policies, business logic and snapshot migrations remain the consumer's concern.
+
+## Testing without Odoo
+
+`FakeOdooTransport` implements the same RPC protocol as a live connection, without
+network access, credential loading, pytest dependencies or application snapshots:
+
+```python
+from odoobase.rpc import RpcClient
+from odoobase.testing import FakeOdooTransport
+
+server = FakeOdooTransport(
+    records={"res.partner": [{"id": 7, "name": "Example"}]},
+    fields={"res.partner": {"name": {"type": "char"}}},
+)
+client = RpcClient(*server.connection())
+assert client.search("res.partner", [], ["name"]) == [{"id": 7, "name": "Example"}]
+```
+
+Records and RPC results are deep-copied; changing the fake does not change the
+input fixture. Access `server["model"]` to inspect or arrange remote state, and
+`server.calls` for recorded `RpcCall` values. `server.connection` also implements
+`ConnectionProvider` for utility entrypoints. It accepts their connection options
+without reading key files or contacting URLs, and checks an explicit target
+database against the fixture's database.
+
+Configure empty tables with `records={"model": []}`. Known fields come only from
+records, `fields` metadata, `defaults` and `children`; no application schemas are
+imported or guessed. Supply metadata for fields written into empty tables.
+Many2one metadata uses `{"type": "many2one", "relation": "target.model"}`. Integer
+relation writes resolve labels from the target's `display_name` or `name`; native
+`[id, label]` writes retain their supplied labels. Referenced targets must exist.
+
+Supported RPC methods are `read`, `search`, `search_read`, `search_count`,
+`fields_get`, `create`, `write` and `unlink`. Searches support prefix `!`, `&`, `|`
+and implicit AND; equality, membership, ordered and like/ilike comparisons;
+sorting, offset/limit, projections and `active_test=False`. Other context values
+are recorded but do not emulate Odoo behavior.
+
+Many2many metadata enables commands 3/4/5/6 (unlink/link/clear/set).
+`children={"parent": {"child_ids": ("child", "parent_id")}}` declares **owned**
+children: reads compute inverse links, writes support commands 0/1/2/4, and
+deleting a parent cascades through those links. Declare only relationships that
+should cascade; this is not automatic ORM/ondelete inference.
+
+Use `before()`/`after()` for scenario effects, `on()` for custom RPC methods,
+`transform_reply()` to alter replies, or one-shot `reply_next()`/`fail_next()`.
+Effects cannot replace the generic CRUD/query handlers. Failed RPCs roll back
+records, field metadata and ID allocation. `fail_next(..., after=True)` instead
+simulates a committed mutation with a lost reply. Optional `ids=` restricts
+one-shot failures/replies to an exact ID batch.
+
+This is a strict, bounded contract fake, not a full Odoo ORM or accounting engine:
+unknown models/fields/methods and unsupported commands fail explicitly.
+Business workflows and application fixture/cache adapters belong downstream.
+DEBUG logs include call metadata and result counts, not query/record values,
+credentials, context or exception messages.
