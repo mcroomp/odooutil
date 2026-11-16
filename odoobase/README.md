@@ -4,15 +4,16 @@ Typed live Odoo infrastructure, independent of applications and local caches.
 Requires Python 3.14.10+ and Pydantic 2. Development uses uv and pins Python 3.14.10.
 
 - `odoobase`: connection factory, RPC protocols and dynamic record validation.
-- `odoobase.models`: native accounting, partner, analytic, product, attachment
-  and budget TypedDicts with standard fields only.
+- `odoobase.models.v19_4`: Odoo 19.4 accounting, partner, analytic, product,
+  attachment and budget TypedDicts with standard fields only.
+- `odoobase.models`: compatibility aliases pinned to the 19.4 model set.
 - `odoobase.relations`: strict Many2one parsing and reference-integrity checks.
 - `odoobase.rpc`: typed RPC client and common operational validation helpers.
 - `odoobase.testing`: stateful, schema-configurable fake RPC transport.
 
 ```python
 from odoobase import get_odoo_models
-from odoobase.models import RawPartner as BaseRawPartner
+from odoobase.models.v19_4 import RawPartner as BaseRawPartner
 from odoobase.rpc import RpcClient
 
 
@@ -38,6 +39,10 @@ No field inventories are fetched automatically, and localization-specific fields
 belong downstream. Decorated contracts preserve extra columns under strict
 Pydantic validation, including custom and dynamic analytic-plan columns.
 Types are not normalized business models or automatic ORM field proxies.
+Different Odoo versions can have different native contracts. Import the explicit
+version module in applications; future model sets will live alongside `v19_4`,
+not change its classes or silently retarget compatibility imports. Only 19.4 is
+provided currently.
 
 `relation_id_optional` accepts positive integer IDs and `[ID, label]`/tuple
 pairs. Only `None` and `False` mean absence. Booleans as IDs, numeric strings,
@@ -65,6 +70,40 @@ server = FakeOdooTransport(
 client = RpcClient(*server.connection())
 assert client.search("res.partner", [], ["name"]) == [{"id": 7, "name": "Example"}]
 ```
+
+For a suite, define model configuration once and keep individual tests about data:
+
+```python
+from odoobase.models.v19_4 import ODOO_VERSION, RawPartner
+from odooutil.testing import FakeOdooTransport, FakeSchema
+
+
+class Partner(RawPartner, total=False):
+    x_reference: str
+
+
+PARTNER_SCHEMA = FakeSchema.from_models({"res.partner": Partner}, odoo_version=ODOO_VERSION)
+server = FakeOdooTransport(schema=PARTNER_SCHEMA)
+```
+
+`from_models` derives allowed field names from native TypedDicts, including
+inherited and application-specific fields, and configures empty model tables.
+Normal tests only provide their records; they do not repeat field inventories.
+It does not guess relation targets or Odoo field types from Python annotations:
+those annotations cannot distinguish, for example, text from a date string.
+Supply explicit metadata only for tests that exercise `fields_get`, relation
+targets not already configured by the application, or server-side effects.
+Schemas carry their declared Odoo version; composing two different declared
+versions raises. Unversioned scenario overrides inherit the application version.
+This is fixture configuration, not automatic live-server version detection.
+
+`FakeSchema` groups field metadata, defaults, relations and owned-child rules.
+Compose application/scenario definitions with `base.extend(overrides)`. Model
+entries are merged by field name (an overriding field definition replaces that
+field's metadata), known field names and cascades are unioned, and a supplied label
+lookup replaces the prior lookup. Direct constructor options remain supported as
+per-test overrides. Each transport copies configuration and records: changing a
+test's fake does not change the reusable schema or another fake.
 
 Records and RPC results are deep-copied; changing the fake does not change the
 input fixture. Access `server["model"]` to inspect or arrange remote state, and

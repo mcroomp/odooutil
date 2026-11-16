@@ -2,13 +2,14 @@
 
 import logging
 import re
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from itertools import count
 from pathlib import Path
 from time import perf_counter
-from typing import Literal, NamedTuple, cast
+from typing import Literal, NamedTuple, cast, get_type_hints, is_typeddict
 
 from odoobase.relations import relation_id_optional
 from odoobase.transport import RpcConnection
@@ -49,6 +50,103 @@ type ReplyTransform = Callable[["FakeOdooTransport", RpcCall, object], object]
 type ChildFilter = Callable[[Mapping[str, object]], bool]
 
 
+def _merge_models[Value](
+    base: Mapping[str, Mapping[str, Value]],
+    overrides: Mapping[str, Mapping[str, Value]],
+) -> dict[str, dict[str, Value]]:
+    return {
+        model: {**base.get(model, {}), **overrides.get(model, {})}
+        for model in base.keys() | overrides.keys()
+    }
+
+
+@dataclass(frozen=True)
+class FakeSchema:
+    """Reusable model configuration; each transport copies its mutable state."""
+
+    fields: Mapping[str, Mapping[str, Mapping[str, object]]] = dataclass_field(
+        default_factory=lambda: dict[str, Mapping[str, Mapping[str, object]]](),
+    )
+    defaults: Mapping[str, Mapping[str, object]] = dataclass_field(
+        default_factory=lambda: dict[str, Mapping[str, object]](),
+    )
+    known_fields: Mapping[str, Collection[str]] = dataclass_field(
+        default_factory=lambda: dict[str, Collection[str]](),
+    )
+    relations: Mapping[str, Mapping[str, str]] = dataclass_field(
+        default_factory=lambda: dict[str, Mapping[str, str]](),
+    )
+    children: Mapping[str, Mapping[str, tuple[str, str]]] = dataclass_field(
+        default_factory=lambda: dict[str, Mapping[str, tuple[str, str]]](),
+    )
+    child_filters: Mapping[str, Mapping[str, ChildFilter]] = dataclass_field(
+        default_factory=lambda: dict[str, Mapping[str, ChildFilter]](),
+    )
+    cascades: Mapping[str, Sequence[tuple[str, str]]] = dataclass_field(
+        default_factory=lambda: dict[str, Sequence[tuple[str, str]]](),
+    )
+    label_fields: tuple[str, ...] | None = None
+    odoo_version: str | None = None
+
+    @classmethod
+    def from_models(
+        cls,
+        models: Mapping[str, type[object]],
+        *,
+        odoo_version: str | None = None,
+    ) -> FakeSchema:
+        """Use extended native TypedDicts as the field-name contract, including inheritance."""
+        for model, row_type in models.items():
+            if not is_typeddict(row_type):
+                raise TypeError(f"Fake model {model} must use a native TypedDict")
+        return cls(
+            odoo_version=odoo_version,
+            known_fields={
+                model: tuple(get_type_hints(row_type)) for model, row_type in models.items()
+            },
+        )
+
+    def extend(self, overrides: FakeSchema) -> FakeSchema:
+        """Overlay model fields, union field names/cascades, and retain other models."""
+        if (
+            self.odoo_version is not None
+            and overrides.odoo_version is not None
+            and self.odoo_version != overrides.odoo_version
+        ):
+            raise ValueError(
+                f"Cannot mix Odoo model schemas {self.odoo_version} and {overrides.odoo_version}",
+            )
+        return FakeSchema(
+            odoo_version=(
+                self.odoo_version if overrides.odoo_version is None else overrides.odoo_version
+            ),
+            fields=_merge_models(self.fields, overrides.fields),
+            defaults=_merge_models(self.defaults, overrides.defaults),
+            known_fields={
+                model: set(self.known_fields.get(model, ()))
+                | set(overrides.known_fields.get(model, ()))
+                for model in self.known_fields.keys() | overrides.known_fields.keys()
+            },
+            relations=_merge_models(self.relations, overrides.relations),
+            children=_merge_models(self.children, overrides.children),
+            child_filters=_merge_models(self.child_filters, overrides.child_filters),
+            cascades={
+                model: tuple(
+                    dict.fromkeys(
+                        (
+                            *self.cascades.get(model, ()),
+                            *overrides.cascades.get(model, ()),
+                        )
+                    )
+                )
+                for model in self.cascades.keys() | overrides.cascades.keys()
+            },
+            label_fields=(
+                self.label_fields if overrides.label_fields is None else overrides.label_fields
+            ),
+        )
+
+
 class FakeOdooTransport:
     """A bounded RPC contract fake, not an Odoo ORM or accounting engine.
 
@@ -59,6 +157,7 @@ class FakeOdooTransport:
     def __init__(
         self,
         *,
+        schema: FakeSchema | None = None,
         records: Mapping[str, Sequence[Mapping[str, object]]] | None = None,
         fields: Mapping[str, Mapping[str, Mapping[str, object]]] | None = None,
         defaults: Mapping[str, Mapping[str, object]] | None = None,
@@ -67,12 +166,37 @@ class FakeOdooTransport:
         cascades: Mapping[str, Sequence[tuple[str, str]]] | None = None,
         known_fields: Mapping[str, Iterable[str]] | None = None,
         relations: Mapping[str, Mapping[str, str]] | None = None,
-        label_fields: Sequence[str] = ("display_name", "name"),
+        label_fields: Sequence[str] | None = None,
         database: str = "fixture",
         user_id: int = 1,
         password: str = "fixture",
     ) -> None:
+        configuration = (FakeSchema() if schema is None else schema).extend(
+            FakeSchema(
+                fields=fields or {},
+                defaults=defaults or {},
+                children=children or {},
+                child_filters=child_filters or {},
+                cascades=cascades or {},
+                known_fields={model: tuple(names) for model, names in (known_fields or {}).items()},
+                relations=relations or {},
+                label_fields=None if label_fields is None else tuple(label_fields),
+            )
+        )
+        fields, defaults, children = (
+            configuration.fields,
+            configuration.defaults,
+            configuration.children,
+        )
+        child_filters, cascades = configuration.child_filters, configuration.cascades
+        known_fields, relations = configuration.known_fields, configuration.relations
+        label_fields = (
+            ("display_name", "name")
+            if configuration.label_fields is None
+            else configuration.label_fields
+        )
         self.trace_id = next(_transport_ids)
+        self.odoo_version = configuration.odoo_version
         self.connection_count = 0
         self.request_count = 0
         self.calls: list[RpcCall] = []
@@ -97,7 +221,12 @@ class FakeOdooTransport:
         self.known_fields = {model: set(names) for model, names in (known_fields or {}).items()}
         self._relations = {model: dict(links) for model, links in (relations or {}).items()}
         self._label_fields = tuple(label_fields)
-        for model in self.fields.keys() | self._defaults.keys() | self._children.keys():
+        for model in (
+            self.fields.keys()
+            | self._defaults.keys()
+            | self._children.keys()
+            | self.known_fields.keys()
+        ):
             self._tables.setdefault(model, {})
         self._identity = database, _id(user_id), password
         self._next_ids = {model: max(rows, default=0) + 1 for model, rows in self._tables.items()}

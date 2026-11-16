@@ -10,6 +10,9 @@ from odoobase.testing import (
     FakeOdooTransport as FakeOdooTransport,
 )
 from odoobase.testing import (
+    FakeSchema as FakeSchema,
+)
+from odoobase.testing import (
     Handler as Handler,
 )
 from odoobase.testing import (

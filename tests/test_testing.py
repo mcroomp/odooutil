@@ -6,9 +6,16 @@ from copy import deepcopy
 import pytest
 
 from odoobase import ConnectionProvider
-from odoobase.testing import FakeOdooTransport, RpcCall
+from odoobase.models import RawPartner
+from odoobase.models.v19_4 import ODOO_VERSION
+from odoobase.models.v19_4 import RawPartner as VersionedPartner
+from odoobase.testing import FakeOdooTransport, FakeSchema, RpcCall
 from odooutil import query
 from odooutil.testing import FakeOdooTransport as UtilityFakeOdooTransport
+
+
+class ExtendedPartner(VersionedPartner, total=False):
+    x_reference: str
 
 
 def rpc(
@@ -414,3 +421,115 @@ def test_filtered_child_projections_and_hidden_cascades_are_independent() -> Non
     assert server["parent"] == server["child"] == server["detail"] == {}
     with pytest.raises(ValueError, match="configured child fields"):
         FakeOdooTransport(child_filters={"parent": {"absent": lambda _: True}})
+
+
+def test_reusable_schema_supports_per_test_overrides_without_sharing_state() -> None:
+    schema = FakeSchema(
+        fields={"item": {"name": {"type": "char"}, "tag_ids": {"type": "many2many"}}},
+        defaults={"item": {"name": "Default", "tag_ids": []}},
+        known_fields={"item": {"extra"}},
+    )
+    first = FakeOdooTransport(schema=schema, defaults={"item": {"name": "First"}})
+    second = FakeOdooTransport(schema=schema)
+    assert rpc(first, "item", "create", [{}]) == 1
+    rpc(first, "item", "write", [[1], {"tag_ids": [[4, 7, 0]]}])
+    first.fields["item"]["name"]["required"] = True
+    first.known_fields["item"].add("only_first")
+    assert rpc(second, "item", "create", [{}]) == 1
+    assert second["item"][1] == {"id": 1, "name": "Default", "tag_ids": []}
+    assert "required" not in second.fields["item"]["name"]
+    assert "only_first" not in second.known_fields["item"]
+    assert schema.defaults["item"]["tag_ids"] == []
+    assert schema.known_fields["item"] == {"extra"}
+
+
+def test_schema_composition_preserves_relations_children_and_hidden_cascades() -> None:
+    base = FakeSchema(
+        known_fields={"parent": {"name"}, "child": {"name"}},
+        children={"parent": {"child_ids": ("child", "parent_id")}},
+        cascades={"parent": [("child", "parent_id")]},
+        label_fields=("title", "name"),
+    )
+    extended = base.extend(
+        FakeSchema(
+            known_fields={"parent": {"title"}},
+            fields={"child": {"other_id": {"type": "many2one", "relation": "other"}}},
+            cascades={"parent": [("child", "parent_id"), ("other", "parent_id")]},
+        )
+    )
+    server = FakeOdooTransport(
+        schema=extended,
+        records={
+            "parent": [{"id": 1, "title": "Parent"}],
+            "child": [],
+            "other": [
+                {"id": 3, "name": "Other", "parent_id": [1, "Parent"]},
+            ],
+        },
+    )
+    rpc(
+        server,
+        "parent",
+        "write",
+        [
+            [1],
+            {
+                "child_ids": [
+                    [
+                        0,
+                        0,
+                        {
+                            "name": "Child",
+                            "other_id": 3,
+                        },
+                    ]
+                ]
+            },
+        ],
+    )
+    assert server["child"][1]["parent_id"] == [1, "Parent"]
+    assert server["child"][1]["other_id"] == [3, "Other"]
+    rpc(server, "parent", "unlink", [[1]])
+    assert server["parent"] == server["child"] == server["other"] == {}
+    assert base.known_fields["parent"] == {"name"}
+
+
+def test_extended_native_models_define_normal_empty_table_writes_and_queries() -> None:
+    schema = FakeSchema.from_models({"res.partner": ExtendedPartner}, odoo_version=ODOO_VERSION)
+    server = FakeOdooTransport(schema=schema)
+    assert RawPartner is VersionedPartner
+    assert server.odoo_version == "19.4"
+    assert (
+        rpc(
+            server,
+            "res.partner",
+            "create",
+            [
+                {
+                    "name": "Example",
+                    "x_reference": "reference",
+                }
+            ],
+        )
+        == 1
+    )
+    assert rpc(server, "res.partner", "search_read", [[]], fields=["name", "x_reference"]) == [
+        {"id": 1, "name": "Example", "x_reference": "reference"},
+    ]
+    with pytest.raises(AssertionError, match="Unknown or immutable"):
+        rpc(server, "res.partner", "write", [[1], {"typo": "Rejected"}])
+    rpc(server, "res.partner", "unlink", [[1]])
+    assert rpc(server, "res.partner", "create", [{"x_reference": "next"}]) == 2
+    with pytest.raises(TypeError, match="TypedDict"):
+        FakeSchema.from_models({"res.partner": dict})
+
+
+def test_schema_composition_rejects_mixed_versions_and_inherits_unversioned_overrides() -> None:
+    schema = FakeSchema.from_models({"res.partner": ExtendedPartner}, odoo_version="19.4")
+    combined = schema.extend(FakeSchema(defaults={"res.partner": {"name": "Default"}}))
+    server = FakeOdooTransport(schema=combined)
+    assert server.odoo_version == "19.4"
+    assert rpc(server, "res.partner", "create", [{}]) == 1
+    assert server["res.partner"][1]["name"] == "Default"
+    with pytest.raises(ValueError, match=r"19\.4 and 18\.0"):
+        schema.extend(FakeSchema(odoo_version="18.0"))
