@@ -26,7 +26,8 @@ uv run --locked --group dev pytest
 uv build
 ```
 
-uv manages `.venv` and `uv.lock`. CI runs the same checks and builds the
+uv manages `.venv` and `uv.lock`. CI installs the pinned Python version with
+`actions/setup-python`, then uses uv to run the same checks and build the
 distribution. Tests use synthetic inputs and mocked RPC, not a live Odoo instance.
 
 Import Linter enforces the one-way dependency `odooutil -> odoobase`, including

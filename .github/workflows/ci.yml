@@ -12,11 +12,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version-file: .python-version
       - uses: astral-sh/setup-uv@v7
         with:
           version: "0.13.1"
           enable-cache: true
-      - run: uv python install
       - run: uv sync --locked --group dev
       - run: uv run --locked --group dev ruff check .
       - run: uv run --locked --group dev ruff format --check .
@@ -27,25 +29,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version-file: .python-version
       - uses: astral-sh/setup-uv@v7
         with:
           version: "0.13.1"
           enable-cache: true
-      - run: uv python install
       - run: uv run --locked --group dev pytest
 
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version-file: .python-version
       - uses: astral-sh/setup-uv@v7
         with:
           version: "0.13.1"
           enable-cache: true
-      - run: uv python install
       - run: uv build
       - uses: actions/upload-artifact@v4
         with:
           name: distributions
           path: dist/*
-
