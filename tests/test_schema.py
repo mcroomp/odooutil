@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from odoobase import RpcRecord
+from odoobase import RpcConnection, RpcRecord
 from odooutil import schema
 from tests.helpers import ScriptedRpc, partner_field
 
@@ -38,6 +38,56 @@ def test_preview_is_read_only() -> None:
     )
     assert plan["action"] == "create"
     assert not rpc.mutations
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize("apply", [False, True])
+def test_schema_cli_accepts_a_provider_without_bypassing_apply_guards(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], apply: bool
+) -> None:
+    rpc = ScriptedRpc()
+    queue_field_preview(rpc)
+    if apply:
+        queue_field_preview(rpc)
+        rpc.queue("ir.model.fields", "create", 2)
+        rpc.queue("ir.model.fields", "search_read", [partner_field()])
+    options: dict[str, object] = {}
+
+    def connect(**kwargs: object) -> RpcConnection:
+        options.update(kwargs)
+        return rpc.connection()
+
+    path = tmp_path / "field.json"
+    path.write_text(
+        json.dumps({"ttype": "char", "field_description": "Reference"}), encoding="utf-8"
+    )
+    argv = [
+        "--key-file",
+        "explicit.key",
+        "--target-url",
+        "https://example.test",
+        "--target-db",
+        "example",
+        "field-create",
+        "res.partner",
+        "x_reference",
+        "--spec",
+        str(path),
+    ]
+    if apply:
+        with pytest.raises(SystemExit):
+            schema.main([*argv, "--apply"], connection_provider=connect)
+        assert not options
+        argv += ["--apply", "--confirm-db", "example", "--journal", str(tmp_path / "journal.json")]
+    schema.main(argv, connection_provider=connect)
+    output = json.loads(capsys.readouterr().out)
+    assert (output["status"] == "verified") if apply else (output["applied"] is False)
+    assert options == {
+        "key_file": Path("explicit.key"),
+        "target_url": "https://example.test",
+        "target_db": "example",
+    }
+    assert len(rpc.mutations) == (1 if apply else 0)
     rpc.assert_complete()
 
 

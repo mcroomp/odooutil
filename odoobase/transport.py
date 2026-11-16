@@ -41,6 +41,20 @@ class _RpcCommon(Protocol):
 
 type RpcConnection = tuple[RpcModels, str, int, str]
 
+
+class ConnectionProvider(Protocol):
+    """Application-owned credential/configuration boundary for live utilities."""
+
+    def __call__(
+        self,
+        *,
+        key_file: Path | None = None,
+        target_url: str | None = None,
+        target_db: str | None = None,
+        rpc_protocol: Literal["xmlrpc", "jsonrpc"] = "xmlrpc",
+    ) -> RpcConnection: ...
+
+
 _record_adapter = TypeAdapter(RpcRecord)
 _records_adapter = TypeAdapter(list[RpcRecord])
 

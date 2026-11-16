@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import NotRequired, TypedDict, TypeGuard
 from urllib.parse import urlsplit
 
-from odoobase import RpcRecord, get_odoo_models, record_list
+from odoobase import ConnectionProvider, RpcRecord, get_odoo_models, record_list
 from odoobase.relations import relation_id_optional
 from odoobase.rpc import RpcClient, load_spec, require
 
@@ -805,10 +805,13 @@ def apply_plan(
     return journal
 
 
-def main(argv: Sequence[str] | None = None) -> None:
+def main(
+    argv: Sequence[str] | None = None, *, connection_provider: ConnectionProvider | None = None
+) -> None:
     args = parse_args(argv)
     spec = validate_spec(load_spec(args.spec))
-    models, db, uid, password = get_odoo_models(
+    connect = get_odoo_models if connection_provider is None else connection_provider
+    models, db, uid, password = connect(
         key_file=args.key_file,
         target_url=args.target_url,
         target_db=args.target_db,

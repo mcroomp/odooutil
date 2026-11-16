@@ -1,6 +1,9 @@
 """Typed live Odoo infrastructure without application state or caching."""
 
 from odoobase.transport import (
+    ConnectionProvider as ConnectionProvider,
+)
+from odoobase.transport import (
     RpcConnection as RpcConnection,
 )
 from odoobase.transport import (

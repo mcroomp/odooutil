@@ -14,7 +14,7 @@ from typing import Literal, TypedDict, TypeGuard
 from urllib.parse import urlsplit
 from xml.etree import ElementTree
 
-from odoobase import RpcRecord, get_odoo_models, record_dict, record_list
+from odoobase import ConnectionProvider, RpcRecord, get_odoo_models, record_dict, record_list
 from odoobase.relations import relation_id_optional
 from odoobase.rpc import CONTEXT, MODEL_NAME_PATTERN, RpcClient, load_spec, require
 
@@ -1290,10 +1290,13 @@ def parse_args(argv: Sequence[str] | None = None) -> SchemaArgs:
     return args
 
 
-def main(argv: Sequence[str] | None = None) -> None:
+def main(
+    argv: Sequence[str] | None = None, *, connection_provider: ConnectionProvider | None = None
+) -> None:
     args = parse_args(argv)
     spec = load_spec(args.spec) if args.spec is not None else None
-    models, db, uid, password = get_odoo_models(
+    connect = get_odoo_models if connection_provider is None else connection_provider
+    models, db, uid, password = connect(
         key_file=args.key_file,
         target_url=args.target_url,
         target_db=args.target_db,
