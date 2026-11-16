@@ -6,15 +6,14 @@ from copy import deepcopy
 import pytest
 
 from odoobase import ConnectionProvider
-from odoobase.models import RawPartner
-from odoobase.models.v19_4 import ODOO_VERSION
-from odoobase.models.v19_4 import RawPartner as VersionedPartner
+from odoobase.models import SUPPORTED_VERSIONS, for_version
+from odoobase.models.v19_4 import ODOO_VERSION, RawPartner
 from odoobase.testing import FakeOdooTransport, FakeSchema, RpcCall
 from odooutil import query
 from odooutil.testing import FakeOdooTransport as UtilityFakeOdooTransport
 
 
-class ExtendedPartner(VersionedPartner, total=False):
+class ExtendedPartner(RawPartner, total=False):
     x_reference: str
 
 
@@ -497,7 +496,6 @@ def test_schema_composition_preserves_relations_children_and_hidden_cascades() -
 def test_extended_native_models_define_normal_empty_table_writes_and_queries() -> None:
     schema = FakeSchema.from_models({"res.partner": ExtendedPartner}, odoo_version=ODOO_VERSION)
     server = FakeOdooTransport(schema=schema)
-    assert RawPartner is VersionedPartner
     assert server.odoo_version == "19.4"
     assert (
         rpc(
@@ -533,3 +531,27 @@ def test_schema_composition_rejects_mixed_versions_and_inherits_unversioned_over
     assert server["res.partner"][1]["name"] == "Default"
     with pytest.raises(ValueError, match=r"19\.4 and 18\.0"):
         schema.extend(FakeSchema(odoo_version="18.0"))
+
+
+@pytest.mark.parametrize("version", SUPPORTED_VERSIONS)
+def test_selected_model_version_drives_independent_fake_schemas(version: str) -> None:
+    models = for_version(version)
+    schema = FakeSchema.from_models(models.MODELS, odoo_version=models.ODOO_VERSION)
+    first = FakeOdooTransport(schema=schema)
+    second = FakeOdooTransport(schema=schema)
+    assert first.odoo_version == version
+    assert rpc(first, "res.partner", "create", [{"name": "Versioned partner"}]) == 1
+    assert rpc(first, "res.partner", "read", [[1]], fields=["name"]) == [
+        {"id": 1, "name": "Versioned partner"},
+    ]
+    assert second["res.partner"] == {}
+    with pytest.raises(AssertionError, match="Unknown or immutable"):
+        rpc(first, "res.partner", "write", [[1], {"not_a_native_field": "Rejected"}])
+
+
+@pytest.mark.parametrize("version", ["18.0", "latest", "", "v19_4"])
+def test_model_version_selection_rejects_unavailable_versions(version: str) -> None:
+    with pytest.raises(
+        ValueError, match=r"Unsupported Odoo model version.*available versions: 19\.4"
+    ):
+        for_version(version)

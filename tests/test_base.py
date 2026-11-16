@@ -10,7 +10,7 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 
 from odoobase import get_odoo_models, record_dict, record_list, search_read, transport
-from odoobase.models import RawPartner
+from odoobase.models.v19_4 import RawPartner
 from odoobase.relations import (
     optional_record,
     relation_id_optional,

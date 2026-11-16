@@ -6,7 +6,6 @@ Requires Python 3.14.10+ and Pydantic 2. Development uses uv and pins Python 3.1
 - `odoobase`: connection factory, RPC protocols and dynamic record validation.
 - `odoobase.models.v19_4`: Odoo 19.4 accounting, partner, analytic, product,
   attachment and budget TypedDicts with standard fields only.
-- `odoobase.models`: compatibility aliases pinned to the 19.4 model set.
 - `odoobase.relations`: strict Many2one parsing and reference-integrity checks.
 - `odoobase.rpc`: typed RPC client and common operational validation helpers.
 - `odoobase.testing`: stateful, schema-configurable fake RPC transport.
@@ -41,8 +40,32 @@ Pydantic validation, including custom and dynamic analytic-plan columns.
 Types are not normalized business models or automatic ORM field proxies.
 Different Odoo versions can have different native contracts. Import the explicit
 version module in applications; future model sets will live alongside `v19_4`,
-not change its classes or silently retarget compatibility imports. Only 19.4 is
-provided currently.
+not change its classes. The `odoobase.models` namespace has no unversioned model
+exports. Only 19.4 is provided currently.
+
+For version-matrix tests, use an explicit selector as the local `models` alias:
+
+```python
+import pytest
+
+from odoobase.models import SUPPORTED_VERSIONS, for_version
+from odooutil.testing import FakeOdooTransport, FakeSchema
+
+
+@pytest.fixture(params=SUPPORTED_VERSIONS)
+def server(request: pytest.FixtureRequest) -> FakeOdooTransport:
+    models = for_version(request.param)
+    schema = FakeSchema.from_models(models.MODELS, odoo_version=models.ODOO_VERSION)
+    return FakeOdooTransport(schema=schema)
+```
+
+`for_version("19.4")` selects the same model inventory explicitly. Unsupported
+versions raise rather than falling back; no global alias or environment state is
+changed. Each version module exposes a read-only `MODELS` inventory keyed by
+native Odoo model name. Tests can pass a subset or overlay matching,
+version-specific extended TypedDicts before calling `from_models`. Production
+type imports remain explicit: selecting a fake's model set does not rebase an
+application's already-defined TypedDict extensions onto another Odoo version.
 
 `relation_id_optional` accepts positive integer IDs and `[ID, label]`/tuple
 pairs. Only `None` and `False` mean absence. Booleans as IDs, numeric strings,

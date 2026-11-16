@@ -5,6 +5,8 @@ these contracts do not imply their presence in every Odoo installation.
 Unknown columns are preserved by runtime validation, not stripped.
 """
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Literal, Required, TypedDict
 
 from pydantic import ConfigDict, with_config
@@ -286,3 +288,29 @@ class RawAnalyticBudget(TypedDict, total=False):
     state: str
     user_id: Relation
     company_id: Relation
+
+
+MODELS: Mapping[str, type[object]] = MappingProxyType(
+    {
+        "account.account": RawAccount,
+        "account.analytic.account": RawAnalyticAccount,
+        "account.analytic.applicability": RawAnalyticApplicability,
+        "account.analytic.line": RawAnalyticLine,
+        "account.analytic.plan": RawAnalyticPlan,
+        "account.asset": RawAsset,
+        "account.bank.statement": RawBankStatement,
+        "account.bank.statement.line": RawBankStatementLine,
+        "account.journal": RawJournal,
+        "account.move": RawMove,
+        "account.move.line": RawMoveLine,
+        "account.partial.reconcile": RawPartialReconcile,
+        "account.tax": RawTax,
+        "budget.analytic": RawAnalyticBudget,
+        "budget.line": RawBudgetLine,
+        "ir.attachment": RawAttachment,
+        "product.product": RawProduct,
+        "res.company": RawCompany,
+        "res.partner": RawPartner,
+        "res.partner.category": RawPartnerCategory,
+    }
+)
