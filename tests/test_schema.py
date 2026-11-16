@@ -3,9 +3,9 @@ import os
 from pathlib import Path
 
 import pytest
+
 from odoobase import RpcRecord
 from odooutil import schema
-
 from tests.helpers import ScriptedRpc, partner_field
 
 

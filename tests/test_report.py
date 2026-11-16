@@ -2,10 +2,10 @@ import json
 from pathlib import Path
 
 import pytest
+
 from odoobase import RpcRecord
 from odoobase.rpc import RpcClient
 from odooutil import report
-
 from tests.helpers import ScriptedRpc
 
 

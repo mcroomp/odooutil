@@ -7,6 +7,8 @@ from typing import Literal
 from urllib.request import Request
 
 import pytest
+from pydantic import TypeAdapter, ValidationError
+
 from odoobase import get_odoo_models, record_dict, record_list, search_read, transport
 from odoobase.models import RawPartner
 from odoobase.relations import (
@@ -16,8 +18,6 @@ from odoobase.relations import (
     required_record,
 )
 from odoobase.rpc import RpcClient
-from pydantic import TypeAdapter, ValidationError
-
 from tests.helpers import ScriptedRpc
 
 
