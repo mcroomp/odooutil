@@ -3,6 +3,29 @@
 Live query, schema and financial-report CLIs built on `odoobase`.
 No caching, snapshot files or organization-specific definitions are included.
 
+## Application integration
+
+Each module's `main(argv=None, *, connection_provider=None)` accepts a typed
+`odoobase.ConnectionProvider`. `query.execute_query` accepts the same keyword.
+An application can supply its credential/configuration boundary without changing
+arguments, monkeypatching globals or duplicating utility orchestration:
+
+```python
+from odooutil.schema import main as schema_main
+from my_application.odoo import get_odoo_models
+
+
+def main(argv=None):
+    schema_main(argv, connection_provider=get_odoo_models)
+```
+
+The provider receives parsed `key_file`, `target_url` and `target_db` keyword
+arguments and returns an `odoobase.RpcConnection`. Reports additionally request
+`rpc_protocol="jsonrpc"`. Preserve these explicit target and protocol selections.
+Without a provider, the ordinary environment/explicit-file factory is used.
+Provider errors propagate without fallback or retry. Parsing, target/database
+confirmation, journals and verification remain the utility's responsibility.
+
 ## Query
 
 ```bash

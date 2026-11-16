@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
 
-from odoobase import get_odoo_models
+from odoobase import ConnectionProvider, get_odoo_models
 from odoobase.rpc import MODEL_NAME_PATTERN
 
 MAX_ROWS = 1000
@@ -88,8 +88,11 @@ def parse_args(argv: Sequence[str] | None = None) -> QueryArgs:
     return args
 
 
-def execute_query(args: QueryArgs) -> object:
-    models, db, uid, password = get_odoo_models(
+def execute_query(
+    args: QueryArgs, *, connection_provider: ConnectionProvider | None = None
+) -> object:
+    connect = get_odoo_models if connection_provider is None else connection_provider
+    models, db, uid, password = connect(
         key_file=args.key_file,
         target_url=args.target_url,
         target_db=args.target_db,
@@ -133,8 +136,10 @@ def execute_query(args: QueryArgs) -> object:
     raise ValueError(f"Unsupported read-only command: {args.command}")
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    result = execute_query(parse_args(argv))
+def main(
+    argv: Sequence[str] | None = None, *, connection_provider: ConnectionProvider | None = None
+) -> None:
+    result = execute_query(parse_args(argv), connection_provider=connection_provider)
     json.dump(result, sys.stdout, ensure_ascii=False, indent=2, sort_keys=True)
     sys.stdout.write("\n")
 

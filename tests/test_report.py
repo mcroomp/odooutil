@@ -183,9 +183,7 @@ def test_report_removals_need_explicit_permission(tmp_path: Path) -> None:
     rpc.assert_complete()
 
 
-def test_report_cli_requests_jsonrpc(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
-) -> None:
+def test_report_cli_requests_jsonrpc(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
     rpc = ScriptedRpc()
     queue_plan(rpc)
     connection_options: dict[str, object] = {}
@@ -194,7 +192,6 @@ def test_report_cli_requests_jsonrpc(
         connection_options.update(kwargs)
         return rpc, "example", 17, "test-key"
 
-    monkeypatch.setattr(report, "get_odoo_models", connect)
     path = tmp_path / "report.json"
     path.write_text(json.dumps(spec()), encoding="utf-8")
     report.main(
@@ -205,9 +202,15 @@ def test_report_cli_requests_jsonrpc(
             "example",
             "--spec",
             str(path),
-        ]
+        ],
+        connection_provider=connect,
     )
-    assert connection_options["rpc_protocol"] == "jsonrpc"
+    assert connection_options == {
+        "key_file": None,
+        "target_url": "https://example.test",
+        "target_db": "example",
+        "rpc_protocol": "jsonrpc",
+    }
     assert json.loads(capsys.readouterr().out)["applied"] is False
     assert not rpc.mutations
     rpc.assert_complete()

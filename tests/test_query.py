@@ -25,7 +25,6 @@ from tests.helpers import ScriptedRpc
     ],
 )
 def test_query_cli_only_performs_requested_read(
-    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     argv: list[str],
     method: str,
@@ -34,8 +33,7 @@ def test_query_cli_only_performs_requested_read(
 ) -> None:
     rpc = ScriptedRpc()
     rpc.queue("res.partner", method, result)
-    monkeypatch.setattr(query, "get_odoo_models", rpc.connection)
-    query.main(argv)
+    query.main(argv, connection_provider=rpc.connection)
     assert json.loads(capsys.readouterr().out) == result
     assert rpc.calls[0].args == args
     if method == "search_read":
