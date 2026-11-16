@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.13.1"
+          enable-cache: true
+      - run: uv python install
+      - run: uv sync --locked --group dev
+      - run: uv run --locked --group dev ruff check .
+      - run: uv run --locked --group dev ruff format --check .
+      - run: uv run --locked --group dev pyright
+      - run: uv run --locked --group dev lint-imports --no-cache
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.13.1"
+          enable-cache: true
+      - run: uv python install
+      - run: uv run --locked --group dev pytest
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.13.1"
+          enable-cache: true
+      - run: uv python install
+      - run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/*
+
