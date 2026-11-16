@@ -1,13 +1,17 @@
-"""Standard native Odoo projections; extend these TypedDicts downstream.
+"""Odoo 19.4 native projections; extend these TypedDicts downstream.
 
 Only IDs are universally required. Optional modules supply some models/fields;
 these contracts do not imply their presence in every Odoo installation.
 Unknown columns are preserved by runtime validation, not stripped.
 """
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Literal, Required, TypedDict
 
 from pydantic import ConfigDict, with_config
+
+ODOO_VERSION = "19.4"
 
 type Relation = int | str | list[int | str] | tuple[int | str, ...] | Literal[False] | None
 
@@ -153,7 +157,13 @@ class RawBankStatement(TypedDict, total=False):
     """account.bank.statement."""
 
     id: Required[int]
+    name: str
+    date: str
+    journal_id: Relation
     line_ids: list[int]
+    balance_start: float
+    balance_end_real: float
+    is_complete: bool
 
 
 class RawBankStatementLine(TypedDict, total=False):
@@ -162,6 +172,11 @@ class RawBankStatementLine(TypedDict, total=False):
     id: Required[int]
     statement_id: Relation
     move_id: Relation
+    date: str
+    payment_ref: str
+    amount: float
+    partner_id: Relation
+    is_reconciled: bool
 
 
 class RawTax(TypedDict, total=False):
@@ -182,6 +197,7 @@ class RawAnalyticPlan(TypedDict, total=False):
     id: Required[int]
     name: str
     parent_id: Relation
+    parent_path: str
     default_applicability: str
 
 
@@ -272,3 +288,29 @@ class RawAnalyticBudget(TypedDict, total=False):
     state: str
     user_id: Relation
     company_id: Relation
+
+
+MODELS: Mapping[str, type[object]] = MappingProxyType(
+    {
+        "account.account": RawAccount,
+        "account.analytic.account": RawAnalyticAccount,
+        "account.analytic.applicability": RawAnalyticApplicability,
+        "account.analytic.line": RawAnalyticLine,
+        "account.analytic.plan": RawAnalyticPlan,
+        "account.asset": RawAsset,
+        "account.bank.statement": RawBankStatement,
+        "account.bank.statement.line": RawBankStatementLine,
+        "account.journal": RawJournal,
+        "account.move": RawMove,
+        "account.move.line": RawMoveLine,
+        "account.partial.reconcile": RawPartialReconcile,
+        "account.tax": RawTax,
+        "budget.analytic": RawAnalyticBudget,
+        "budget.line": RawBudgetLine,
+        "ir.attachment": RawAttachment,
+        "product.product": RawProduct,
+        "res.company": RawCompany,
+        "res.partner": RawPartner,
+        "res.partner.category": RawPartnerCategory,
+    }
+)
