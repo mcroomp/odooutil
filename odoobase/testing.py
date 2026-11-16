@@ -2,7 +2,7 @@
 
 import logging
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from itertools import count
@@ -46,6 +46,7 @@ class _Reply:
 type Handler = Callable[["FakeOdooTransport", RpcCall], object]
 type Effect = Callable[["FakeOdooTransport", RpcCall], None]
 type ReplyTransform = Callable[["FakeOdooTransport", RpcCall, object], object]
+type ChildFilter = Callable[[Mapping[str, object]], bool]
 
 
 class FakeOdooTransport:
@@ -62,6 +63,11 @@ class FakeOdooTransport:
         fields: Mapping[str, Mapping[str, Mapping[str, object]]] | None = None,
         defaults: Mapping[str, Mapping[str, object]] | None = None,
         children: Mapping[str, Mapping[str, tuple[str, str]]] | None = None,
+        child_filters: Mapping[str, Mapping[str, ChildFilter]] | None = None,
+        cascades: Mapping[str, Sequence[tuple[str, str]]] | None = None,
+        known_fields: Mapping[str, Iterable[str]] | None = None,
+        relations: Mapping[str, Mapping[str, str]] | None = None,
+        label_fields: Sequence[str] = ("display_name", "name"),
         database: str = "fixture",
         user_id: int = 1,
         password: str = "fixture",
@@ -70,14 +76,9 @@ class FakeOdooTransport:
         self.connection_count = 0
         self.request_count = 0
         self.calls: list[RpcCall] = []
-        self._tables: dict[str, dict[int, dict[str, object]]] = {}
-        for model, rows in (records or {}).items():
-            table = self._tables.setdefault(model, {})
-            for row in rows:
-                record_id = _id(row["id"])
-                if record_id in table:
-                    raise ValueError(f"Duplicate fake record: {model}({record_id})")
-                table[record_id] = deepcopy(dict(row))
+        self._tables = _record_tables(records or {})
+        self._initial_ids = {model: set(rows) for model, rows in self._tables.items()}
+        self._seeded = False
         self.fields = {
             model: {name: deepcopy(dict(metadata)) for name, metadata in definitions.items()}
             for model, definitions in (fields or {}).items()
@@ -86,6 +87,16 @@ class FakeOdooTransport:
             model: deepcopy(dict(values)) for model, values in (defaults or {}).items()
         }
         self._children = {model: dict(links) for model, links in (children or {}).items()}
+        self._child_filters = {
+            model: dict(filters) for model, filters in (child_filters or {}).items()
+        }
+        for model, filters in self._child_filters.items():
+            if filters.keys() - self._children.get(model, {}).keys():
+                raise ValueError(f"Child filters require configured child fields: {model}")
+        self._cascades = {model: tuple(links) for model, links in (cascades or {}).items()}
+        self.known_fields = {model: set(names) for model, names in (known_fields or {}).items()}
+        self._relations = {model: dict(links) for model, links in (relations or {}).items()}
+        self._label_fields = tuple(label_fields)
         for model in self.fields.keys() | self._defaults.keys() | self._children.keys():
             self._tables.setdefault(model, {})
         self._identity = database, _id(user_id), password
@@ -96,6 +107,28 @@ class FakeOdooTransport:
         self._reply_transforms: dict[tuple[str, str], ReplyTransform] = {}
         self._failures: list[_Failure] = []
         self._replies: list[_Reply] = []
+        logger.debug("fake_odoo_transport_created transport=%s", self.trace_id)
+
+    def seed_records(
+        self,
+        records: Mapping[str, Sequence[Mapping[str, object]]],
+    ) -> None:
+        """Merge a fixture baseline once, preserving arranged remote changes/deletions."""
+        if self._seeded:
+            raise ValueError("A fake transport can be seeded only once")
+        tables = _record_tables(records)
+        for model, rows in self._tables.items():
+            table = tables.setdefault(model, {})
+            for record_id in self._initial_ids.get(model, set()) - rows.keys():
+                table.pop(record_id, None)
+            for record_id, row in rows.items():
+                table[record_id] = {**table.get(record_id, {}), **deepcopy(row)}
+        self._next_ids = {
+            model: max(self._next_ids.get(model, 1), max(rows, default=0) + 1)
+            for model, rows in tables.items()
+        }
+        self._tables = tables
+        self._seeded = True
 
     def __getitem__(self, model: str) -> dict[int, dict[str, object]]:
         if model not in self._tables:
@@ -114,6 +147,11 @@ class FakeOdooTransport:
         if target_db is not None and target_db != self._identity[0]:
             raise AssertionError(f"Unexpected fake target database: {target_db}")
         self.connection_count += 1
+        logger.debug(
+            "fake_odoo_connection_requested transport=%s connection_count=%s",
+            self.trace_id,
+            self.connection_count,
+        )
         return self, *self._identity
 
     def on(self, model: str, method: str, handler: Handler) -> None:
@@ -365,6 +403,8 @@ class FakeOdooTransport:
     def _known_fields(self, model: str) -> set[str]:
         return (
             {"id"}
+            | self.known_fields.get(model, set())
+            | set(self._relations.get(model, {}))
             | set(self.fields.get(model, {}))
             | set(self._defaults.get(model, {}))
             | {field for row in self[model].values() for field in row}
@@ -380,10 +420,12 @@ class FakeOdooTransport:
     def _field(self, model: str, row: Mapping[str, object], field: str) -> object:
         if field in self._children.get(model, {}):
             child, inverse = self._children[model][field]
+            predicate = self._child_filters.get(model, {}).get(field)
             return [
                 record_id
                 for record_id, item in self[child].items()
                 if relation_id_optional(item.get(inverse)) == row["id"]
+                and (predicate is None or predicate(item))
             ]
         if field in row:
             return row[field]
@@ -563,7 +605,10 @@ class FakeOdooTransport:
                     continue
                 related = self[target][related_id]
                 if isinstance(value, int):
-                    label = related.get("display_name", related.get("name"))
+                    label = next(
+                        (related[name] for name in self._label_fields if name in related),
+                        None,
+                    )
                     if not isinstance(label, str):
                         raise AssertionError(
                             f"Supply a native relation label for {target}({related_id})"
@@ -576,7 +621,8 @@ class FakeOdooTransport:
 
     def _unlink(self, model: str, record_id: int) -> None:
         del self[model][record_id]
-        for child, inverse in set(self._children.get(model, {}).values()):
+        children = set(self._children.get(model, {}).values()) | set(self._cascades.get(model, ()))
+        for child, inverse in children:
             for child_id in list(self[child]):
                 if (
                     child_id in self[child]
@@ -591,10 +637,26 @@ class FakeOdooTransport:
         relation = definition.get("relation")
         if isinstance(relation, str):
             return relation
+        if field in self._relations.get(model, {}):
+            return self._relations[model][field]
         for parent, links in self._children.items():
             if (model, field) in links.values():
                 return parent
         return None
+
+
+def _record_tables(
+    records: Mapping[str, Sequence[Mapping[str, object]]],
+) -> dict[str, dict[int, dict[str, object]]]:
+    tables: dict[str, dict[int, dict[str, object]]] = {}
+    for model, rows in records.items():
+        table = tables.setdefault(model, {})
+        for row in rows:
+            record_id = _id(row["id"])
+            if record_id in table:
+                raise ValueError(f"Duplicate fake record: {model}({record_id})")
+            table[record_id] = deepcopy(dict(row))
+    return tables
 
 
 def _id(value: object) -> int:

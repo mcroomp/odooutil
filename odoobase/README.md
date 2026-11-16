@@ -73,12 +73,27 @@ input fixture. Access `server["model"]` to inspect or arrange remote state, and
 without reading key files or contacting URLs, and checks an explicit target
 database against the fixture's database.
 
+The same API is available from `odooutil.testing`; the implementation stays in
+`odoobase` to preserve the one-way package dependency.
+
 Configure empty tables with `records={"model": []}`. Known fields come only from
 records, `fields` metadata, `defaults` and `children`; no application schemas are
 imported or guessed. Supply metadata for fields written into empty tables.
+Alternatively, `known_fields={"model": ["field"]}` declares projection/write
+names without inventing `fields_get` metadata; the public `known_fields` sets
+can also be extended with dynamically discovered columns.
 Many2one metadata uses `{"type": "many2one", "relation": "target.model"}`. Integer
 relation writes resolve labels from the target's `display_name` or `name`; native
 `[id, label]` writes retain their supplied labels. Referenced targets must exist.
+`relations={"model": {"field_id": "target.model"}}` configures relation targets
+separately from field metadata. `label_fields=("display_name", "title")` selects
+the ordered label lookup for integer relation writes.
+
+`seed_records({"model": [...]})` merges a fixture baseline once. Prearranged
+remote rows override baseline fields, explicit deletions remain deleted, and
+allocated IDs, hooks, counters and queued failures/replies are preserved.
+Inputs are copied and invalid/duplicate IDs fail before replacing state.
+Snapshot loading, cross-file conflict detection and model naming stay downstream.
 
 Supported RPC methods are `read`, `search`, `search_read`, `search_count`,
 `fields_get`, `create`, `write` and `unlink`. Searches support prefix `!`, `&`, `|`
@@ -91,6 +106,10 @@ Many2many metadata enables commands 3/4/5/6 (unlink/link/clear/set).
 children: reads compute inverse links, writes support commands 0/1/2/4, and
 deleting a parent cascades through those links. Declare only relationships that
 should cascade; this is not automatic ORM/ondelete inference.
+`child_filters={"parent": {"child_ids": predicate}}` filters a particular child
+projection without changing its owning relationship or deletion behavior.
+`cascades={"parent": [("child", "parent_id")]}` adds owned deletion links that
+should not introduce a projected child field.
 
 Use `before()`/`after()` for scenario effects, `on()` for custom RPC methods,
 `transform_reply()` to alter replies, or one-shot `reply_next()`/`fail_next()`.

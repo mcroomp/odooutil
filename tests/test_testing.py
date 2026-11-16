@@ -8,6 +8,7 @@ import pytest
 from odoobase import ConnectionProvider
 from odoobase.testing import FakeOdooTransport, RpcCall
 from odooutil import query
+from odooutil.testing import FakeOdooTransport as UtilityFakeOdooTransport
 
 
 def rpc(
@@ -324,3 +325,92 @@ def test_before_hook_observes_original_state() -> None:
     server.before("item", "write", lambda remote, _: seen.append(dict(remote["item"][1])))
     rpc(server, "item", "write", [[1], {"name": "After"}])
     assert seen == [{"id": 1, "name": "Before"}]
+
+
+def test_seed_records_preserves_remote_changes_deletions_hooks_and_id_allocation() -> None:
+    server = UtilityFakeOdooTransport(
+        records={
+            "item": [
+                {"id": 7, "name": "Original"},
+                {"id": 8, "name": "Deleted"},
+            ]
+        }
+    )
+    server["item"][7]["name"] = "Remote"
+    del server["item"][8]
+    server.fail_next("item", "write", RuntimeError("Still queued"))
+    baseline: dict[str, list[dict[str, object]]] = {
+        "item": [
+            {"id": 7, "name": "Cached", "active": True},
+            {"id": 8, "name": "Cached deletion"},
+            {"id": 3, "name": "Cache-only"},
+        ]
+    }
+    server.seed_records(baseline)
+    server["item"][3]["name"] = "Detached"
+    assert baseline["item"][2]["name"] == "Cache-only"
+    assert server["item"][7] == {"id": 7, "name": "Remote", "active": True}
+    assert 8 not in server["item"]
+    assert rpc(server, "item", "create", [{"name": "New"}]) == 9
+    with pytest.raises(RuntimeError, match="Still queued"):
+        rpc(server, "item", "write", [[7], {"name": "Rejected"}])
+    with pytest.raises(ValueError, match="seeded only once"):
+        server.seed_records({})
+
+
+def test_invalid_seed_does_not_replace_state_or_consume_seeding_opportunity() -> None:
+    server = FakeOdooTransport(records={"item": [{"id": 1, "name": "Before"}]})
+    with pytest.raises(ValueError, match="Duplicate fake record"):
+        server.seed_records({"item": [{"id": 2}, {"id": 2}]})
+    assert server["item"] == {1: {"id": 1, "name": "Before"}}
+    server.seed_records({"item": [{"id": 2, "name": "Added"}]})
+    assert set(server["item"]) == {1, 2}
+
+
+def test_explicit_schema_names_relations_and_label_fields_work_without_field_metadata() -> None:
+    server = FakeOdooTransport(
+        records={"item": [], "owner": [{"id": 7, "title": "Seven"}]},
+        known_fields={"item": ["name", "owner_id", "dynamic_id"]},
+        relations={"item": {"owner_id": "owner"}},
+        label_fields=("display_name", "title"),
+    )
+    assert rpc(server, "item", "search_read", [[]], fields=["dynamic_id"]) == []
+    assert rpc(server, "item", "create", [{"name": "New", "owner_id": 7}]) == 1
+    assert server["item"][1]["owner_id"] == [7, "Seven"]
+    rpc(server, "item", "unlink", [[1]])
+    assert rpc(server, "item", "create", [{"name": "Next"}]) == 2
+    server.known_fields["item"].add("later_id")
+    assert rpc(server, "item", "fields_get", [["later_id"]]) == {
+        "later_id": {"type": "fixture"},
+    }
+
+
+def test_filtered_child_projections_and_hidden_cascades_are_independent() -> None:
+    server = FakeOdooTransport(
+        records={
+            "parent": [{"id": 1, "name": "Parent"}],
+            "child": [
+                {"id": 2, "parent_id": [1, "Parent"], "visible": True},
+                {"id": 3, "parent_id": [1, "Parent"], "visible": False},
+            ],
+            "detail": [{"id": 4, "child_id": [3, "Hidden"]}],
+        },
+        children={
+            "parent": {
+                "child_ids": ("child", "parent_id"),
+                "visible_ids": ("child", "parent_id"),
+            }
+        },
+        child_filters={"parent": {"visible_ids": lambda row: row["visible"] is True}},
+        cascades={"child": [("detail", "child_id")]},
+    )
+    assert rpc(server, "parent", "read", [[1]]) == [
+        {"id": 1, "name": "Parent", "child_ids": [2, 3], "visible_ids": [2]},
+    ]
+    assert rpc(server, "child", "read", [[3]]) == [
+        {"id": 3, "parent_id": [1, "Parent"], "visible": False},
+    ]
+    rpc(server, "parent", "unlink", [[1]])
+    assert server["parent"] == server["child"] == server["detail"] == {}
+    with pytest.raises(ValueError, match="configured child fields"):
+        FakeOdooTransport(child_filters={"parent": {"absent": lambda _: True}})
