@@ -29,6 +29,7 @@ uv build
 uv manages `.venv` and `uv.lock`. CI installs the pinned Python version with
 `actions/setup-python`, then uses uv to run the same checks and build the
 distribution. Tests use synthetic inputs and mocked RPC, not a live Odoo instance.
+CI actions are pinned to full commit SHAs, with updates handled by Dependabot.
 
 Import Linter enforces the one-way dependency `odooutil -> odoobase`, including
 type-checking imports. The base must never depend on the utilities.
