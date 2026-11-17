@@ -72,6 +72,7 @@ Supported commands:
 | Contextual server-action definitions | `action-create`, `action-read` |
 | New scalar/Many2one/JSON records | `record-create` |
 | Existing scalar/Many2one/JSON record values | `record-set`, `record-set-batch` |
+| Private attachments on existing records | `attachment-upload` |
 
 Schema specs use native Odoo names. Manual model/field names require `x_`.
 Model creation needs explicit `access` rules with name, positive verified
@@ -83,6 +84,33 @@ Field type/relation migrations and removing selection values are refused.
 Deletion requires `--allow-data-loss` and passes dependency checks first.
 Action creation checks code syntax and group access but never executes the action.
 
+An existing `x_name` char field on an empty manual `x_` model can be made a
+stored computed display name with `field-update`. Supply `compute` (reviewed
+Python code), `depends` (comma-separated field paths), `store: true`,
+`readonly: true` and `copied: false`. For example:
+
+```json
+{
+  "compute": "for record in self:\n    record['x_name'] = '%s - %s' % (record['x_date'], record['x_partner_id'].name)",
+  "depends": "x_date,x_partner_id.name",
+  "store": true,
+  "readonly": true,
+  "copied": false
+}
+```
+
+Dependency paths are checked against accessible fields and may traverse only
+Many2one relations. Self-dependencies, computation changes and conversions of
+populated models (including archived records) are refused. Existing computations
+remain read-only, stored and non-copyable. The computed name must not have
+`required: true`: manual computations are not
+precomputed, so Odoo can reject creation before generating the name. Make the
+source fields required instead. Python syntax is checked locally; Odoo validates
+its safe-eval restrictions when saving. The code runs in Odoo
+when the field is computed; review it before applying. This does not install or
+require an automation module. Native dependency recomputation handles changes to
+the referenced fields. Other computed fields remain outside this utility's scope.
+
 `model-enable-chatter MODEL` enables chatter only on an existing manual `x_`
 model, without a spec. It previews by default and uses the same apply,
 database-confirmation and exclusive-journal requirements. This affects all
@@ -93,6 +121,41 @@ Adding `<chatter/>` to the form is a separate `view-create` operation using an
 inherited view; separate operations are not atomic. If the view step fails,
 the model remains chatter-enabled. Inspect the journals before taking further
 action; do not retry an uncertain mutation.
+
+### Original attachments
+
+`attachment-upload MODEL ID --file FILE` previews a private binary attachment
+on an existing, accessible record. It requires the native writable `ir.attachment.raw`
+field and a nonempty local file; there is no spec or public-upload option.
+
+```bash
+odoo-schema --target-url https://example.odoo.com --target-db example \
+  attachment-upload res.partner 123 --file ./evidence.pdf
+```
+
+After reviewing the preview, add `--apply --confirm-db example --journal NEW_FILE`.
+The command rechecks the target (including `write_date` when available), file
+digests and duplicate scope immediately before applying. Matching checksums are
+scoped to ordinary attachments on that target, not other records or binary fields.
+One existing private match produces a verified `reuse` with no write and retains
+its filename. Multiple matches or a public match require review.
+
+New uploads use the original basename, `public: false` and native
+`image_no_postprocess` context to avoid image resizing. Readback verifies the
+target, filename, privacy, size, native SHA-1 checksum and exact original bytes.
+Both native binary readback forms (base64 text and an object containing `content`)
+are supported. Previews and private journals contain metadata and digests, never
+the file bytes or base64 payload.
+
+Quiet mode is the default, with the same automation acknowledgement and linked
+chatter/mail audits as record changes. Audits concern the existing target, not
+the new attachment ID. Creating a parent record and attaching a file are separate
+transactions; this command neither creates the parent nor changes its schema or
+primary-attachment selection. A failed/uncertain upload retains a review journal:
+inspect live state before retrying; no automatic retry or rollback is attempted.
+Source files and target records are not locked against concurrent changes.
+
+### Record values
 
 Record specs contain `values` and optional recommended `expected` guards:
 
@@ -121,6 +184,13 @@ binary, x2many, readonly,
 non-stored, related and system/chatter fields are refused. Dates use YYYY-MM-DD;
 datetimes use YYYY-MM-DD HH:MM:SS in UTC. Use native `false`, not null, to clear
 optional values. `--lang CODE` selects an installed language for record mutations.
+
+Writable Reference fields accept `model,positive_id` strings or `false`. The
+model must appear in the field's native selection and the target record must
+exist and be accessible, including at the apply recheck. For example, an
+`ir.ui.menu` record can link its `action` to an existing window action with
+`"action": "ir.actions.act_window,123"`. Menu `parent_id` uses the ordinary
+Many2one ID; model ACLs still govern access to the linked records.
 
 Quiet chatter is the default, not a bypass for server hooks. Installed automation
 requires explicit reviewed `--allow-automation`; `--chatter normal` opts into
