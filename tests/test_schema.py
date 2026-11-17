@@ -130,6 +130,7 @@ def test_computed_name_refuses_existing_records(tmp_path: Path, stale: bool) -> 
 @pytest.mark.parametrize(
     ("changes", "message"),
     [
+        ({"required": True}, "must not be required inputs"),
         ({"readonly": False}, "readonly=true"),
         ({"copied": True}, "copied=false"),
         ({"compute": "for:"}, "invalid syntax"),

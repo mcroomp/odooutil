@@ -102,6 +102,9 @@ Dependency paths are checked against accessible fields and may traverse only
 Many2one relations. Self-dependencies, computation changes and conversions of
 populated models (including archived records) are refused. Existing computations
 remain read-only, stored and non-copyable. Python syntax is checked locally;
+the computed name must not have `required: true`: manual computations are not
+precomputed, so Odoo can reject creation before generating the name. Make the
+source fields required instead.
 Odoo validates its safe-eval restrictions when saving. The code runs in Odoo
 when the field is computed; review it before applying. This does not install or
 require an automation module. Native dependency recomputation handles changes to

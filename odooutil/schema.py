@@ -285,6 +285,10 @@ def field_values(
         )
         effective = {**(before or {}), **spec}
         require(
+            not effective.get("required", False),
+            "Computed names must not be required inputs; require their source fields instead",
+        )
+        require(
             effective.get("readonly") is True
             and effective.get("store") is True
             and effective.get("copied") is False,
