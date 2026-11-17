@@ -146,6 +146,13 @@ non-stored, related and system/chatter fields are refused. Dates use YYYY-MM-DD;
 datetimes use YYYY-MM-DD HH:MM:SS in UTC. Use native `false`, not null, to clear
 optional values. `--lang CODE` selects an installed language for record mutations.
 
+Writable Reference fields accept `model,positive_id` strings or `false`. The
+model must appear in the field's native selection and the target record must
+exist and be accessible, including at the apply recheck. For example, an
+`ir.ui.menu` record can link its `action` to an existing window action with
+`"action": "ir.actions.act_window,123"`. Menu `parent_id` uses the ordinary
+Many2one ID; model ACLs still govern access to the linked records.
+
 Quiet chatter is the default, not a bypass for server hooks. Installed automation
 requires explicit reviewed `--allow-automation`; `--chatter normal` opts into
 normal tracking. Linked chatter/mail is audited where supported (including on

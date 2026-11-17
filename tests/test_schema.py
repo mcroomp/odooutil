@@ -329,6 +329,77 @@ def test_record_updates_and_noops_keep_expected_value_guards(tmp_path: Path, noo
     rpc.assert_complete()
 
 
+@pytest.mark.parametrize("failure", [None, "missing", "stale", "readback"])
+def test_reference_records_validate_targets_recheck_and_verify(
+    tmp_path: Path, failure: str | None
+) -> None:
+    rpc = ScriptedRpc()
+    metadata = {
+        "action": {
+            "type": "reference",
+            "selection": [["ir.actions.act_window", "Window Action"]],
+        }
+    }
+    for attempt in range(1 if failure == "missing" else 2):
+        rpc.queue("ir.ui.menu", "fields_get", metadata)
+        missing = failure == "missing" or (failure == "stale" and attempt == 1)
+        rpc.queue("ir.actions.act_window", "search_read", [] if missing else [{"id": 7}])
+        if not missing:
+            rpc.queue("ir.module.module", "search_read", [])
+    values = {"action": "ir.actions.act_window,7"}
+    if failure in {None, "readback"}:
+        rpc.queue("ir.ui.menu", "create", 42)
+        rpc.queue(
+            "ir.ui.menu",
+            "search_read",
+            [{"id": 42, "action": False if failure == "readback" else values["action"]}],
+        )
+    args = arguments(tmp_path)
+    args.command, args.model = "record-create", "ir.ui.menu"
+    client = schema.SchemaClient(*rpc.connection())
+    if failure == "missing":
+        with pytest.raises(ValueError, match="referenced record"):
+            schema.build_plan(client, args, {"values": values})
+    else:
+        plan = schema.build_plan(client, args, {"values": values})
+        if failure:
+            with pytest.raises(ValueError, match=r"referenced record|Saved field value mismatch"):
+                schema.apply_plan(client, args, plan)
+        else:
+            assert schema.apply_plan(client, args, plan)["status"] == "verified"
+            assert rpc.mutations[0].args == [values]
+        journal = json.loads((tmp_path / "journal.json").read_text(encoding="utf-8"))
+        assert journal["status"] == ("verified" if failure is None else "requires_review")
+    assert len(rpc.mutations) == (1 if failure in {None, "readback"} else 0)
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        7,
+        True,
+        "",
+        "ir.actions.act_window,0",
+        "ir.actions.act_window,01",
+        "ir.actions.act_window,-7",
+        "ir.actions.act_window,7,8",
+        "res.partner,7",
+        "ir.actions.act_window,7.0",
+        "ir.actions.act_window, 7",
+    ],
+)
+def test_reference_values_refuse_malformed_or_unlisted_targets(value: object) -> None:
+    field: RpcRecord = {
+        "type": "reference",
+        "selection": [["ir.actions.act_window", "Window Action"]],
+    }
+    with pytest.raises(ValueError, match=r"References must|Unknown reference model"):
+        schema.record_value(field, value)
+    assert schema.record_value(field, False) is False
+
+
 @pytest.mark.parametrize("apply", [False, True])
 @pytest.mark.parametrize("chatter", ["quiet", "normal"])
 def test_record_create_cli_previews_or_creates_with_context_and_readback(

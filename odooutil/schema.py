@@ -648,7 +648,21 @@ RECORD_TYPES = {
     "selection",
     "many2one",
     "json",
+    "reference",
 }
+
+
+def reference_parts(value: object) -> tuple[str, int]:
+    model, separator, identifier = text(
+        value, "References must use model,positive_id or false"
+    ).partition(",")
+    require(
+        bool(separator)
+        and MODEL_NAME_PATTERN.fullmatch(model) is not None
+        and re.fullmatch(r"[1-9][0-9]*", identifier) is not None,
+        "References must use model,positive_id or false",
+    )
+    return model, int(identifier)
 
 
 def record_value(field: RpcRecord, value: object, *, reading: bool = False) -> object:
@@ -668,6 +682,13 @@ def record_value(field: RpcRecord, value: object, *, reading: bool = False) -> o
         )
         require(reading or not field.get("required"), "Cannot clear a required field")
         return False
+    if kind == "reference":
+        model, _ = reference_parts(value)
+        require(
+            model in {text(object_list(item)[0]) for item in object_list(field["selection"])},
+            f"Unknown reference model: {model}",
+        )
+        return value
     if kind == "json":
         require(isinstance(value, dict), "JSON values must be objects or false")
         require(
@@ -809,6 +830,12 @@ def record_plan(client: RpcClient, args: SchemaArgs, spec: RpcRecord | None) -> 
                     client.one(text(field["relation"]), [["id", "=", normalized[name]]], ["id"])
                     is not None,
                     f"Unknown or inaccessible related record for {name}",
+                )
+            if field["type"] == "reference" and normalized[name] is not False:
+                model, identifier = reference_parts(normalized[name])
+                require(
+                    client.one(model, [["id", "=", identifier]], ["id"]) is not None,
+                    f"Unknown or inaccessible referenced record for {name}",
                 )
     columns = ["id", *sorted(names)]
     if "write_date" in fields:
