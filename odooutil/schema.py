@@ -152,6 +152,8 @@ FIELD_KEYS = {
     "relation_table",
     "column1",
     "column2",
+    "compute",
+    "depends",
 }
 
 
@@ -171,6 +173,8 @@ FIELD_COLUMNS = [
     "groups",
     "related",
     "store",
+    "compute",
+    "depends",
 ]
 
 
@@ -272,7 +276,36 @@ def field_values(
     field_type = spec.get("ttype", before["ttype"] if before else None)
     require(field_type in FIELD_TYPES, f"Unsupported field type: {field_type}")
     related = spec.get("related", before.get("related") if before else None)
-    if related:
+    compute = spec.get("compute", before.get("compute") if before else None)
+    if compute:
+        require(not related, "Computed names cannot also be related fields")
+        require(
+            before is not None and before["name"] == "x_name" and field_type == "char",
+            "Computed fields are limited to an existing manual-model x_name char field",
+        )
+        effective = {**(before or {}), **spec}
+        require(
+            effective.get("readonly") is True
+            and effective.get("store") is True
+            and effective.get("copied") is False,
+            "Computed names require readonly=true, store=true, copied=false",
+        )
+        code = text(compute)
+        require(bool(code.strip()), "Computed names require nonempty Python code")
+        compile(code, "<computed-name>", "exec")
+        depends = text(effective.get("depends"))
+        validate_compute_dependencies(client, model, depends)
+        if before and before.get("compute"):
+            require(
+                code == before["compute"] and depends == before.get("depends"),
+                "Changing an existing computation requires an explicit migration",
+            )
+        else:
+            require(
+                client.call(model, "search_count", [[]], context={"active_test": False}) == 0,
+                "Adding a computation to populated models requires an explicit migration",
+            )
+    elif related:
         require(field_type == "boolean", "Only related boolean fields are supported")
         effective = {**(before or {}), **spec}
         require(
@@ -285,7 +318,7 @@ def field_values(
         validate_related_boolean(client, model, text(related))
     else:
         require(
-            not {"related", "store"} & spec.keys(),
+            not {"related", "store", "compute", "depends"} & spec.keys(),
             "related/store settings require a related boolean field",
         )
     for key in ("field_description", "help", "relation", "on_delete"):
@@ -389,6 +422,34 @@ def field_values(
     else:
         require("selection" not in spec, "selection choices require a selection field")
     return values
+
+
+def validate_compute_dependencies(client: SchemaClient, model: str, depends: str) -> None:
+    paths = [path.strip() for path in depends.split(",")]
+    require(
+        0 < len(paths) <= 20
+        and all(re.fullmatch(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){0,7}", p) for p in paths),
+        "depends must contain 1-20 comma-separated field paths",
+    )
+    for path in paths:
+        current_model = model
+        parts = path.split(".")
+        for index, name in enumerate(parts):
+            require(
+                current_model != model or name != "x_name",
+                "Computed names cannot depend on themselves",
+            )
+            fields = object_dict(
+                client.call(current_model, "fields_get", [[name]], attributes=["type", "relation"])
+            )
+            require(name in fields, f"Unknown or inaccessible dependency: {current_model}.{name}")
+            field = object_dict(fields[name])
+            if index < len(parts) - 1:
+                require(
+                    field.get("type") == "many2one" and bool(field.get("relation")),
+                    "Dependencies must traverse only Many2one fields",
+                )
+                current_model = text(field["relation"])
 
 
 def validate_related_boolean(client: SchemaClient, model: str, path: str) -> None:
@@ -956,6 +1017,13 @@ def build_plan(client: SchemaClient, args: SchemaArgs, spec: RpcRecord | None) -
     if action in ("create", "update"):
         if spec is None:
             raise ValueError("Missing spec")
+        if kind == "field" and (
+            {"compute", "depends"} & spec.keys() or (before and before.get("compute"))
+        ):
+            require(
+                owner["state"] == "manual" and args.model.startswith("x_"),
+                "Computed names require a manual x_ model",
+            )
         values = (
             field_values(client, spec, before, args.model)
             if kind == "field"

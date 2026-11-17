@@ -41,6 +41,156 @@ def test_preview_is_read_only() -> None:
     rpc.assert_complete()
 
 
+def computed_name_spec() -> RpcRecord:
+    return {
+        "compute": (
+            "for record in self:\n"
+            "    record['x_name'] = '%s - %s' % "
+            "(record['x_date'], record['x_partner_id'].name)"
+        ),
+        "depends": "x_date,x_partner_id.name",
+        "store": True,
+        "readonly": True,
+        "copied": False,
+    }
+
+
+def computed_name_field() -> RpcRecord:
+    return {
+        **partner_field(),
+        "name": "x_name",
+        "model": "x_document",
+        "compute": False,
+        "depends": False,
+        "readonly": False,
+        "copied": True,
+        "store": True,
+    }
+
+
+def queue_computed_name_preview(rpc: ScriptedRpc, *, records: int = 0) -> None:
+    rpc.queue("ir.model", "search_read", [{"id": 1, "model": "x_document", "state": "manual"}])
+    rpc.queue("ir.model.fields", "search_read", [computed_name_field()])
+    rpc.queue("x_document", "fields_get", {"x_date": {"type": "date"}})
+    rpc.queue(
+        "x_document",
+        "fields_get",
+        {"x_partner_id": {"type": "many2one", "relation": "res.partner"}},
+    )
+    rpc.queue("res.partner", "fields_get", {"name": {"type": "char"}})
+    rpc.queue("x_document", "search_count", records)
+
+
+def test_computed_name_is_previewed_journaled_and_verified(tmp_path: Path) -> None:
+    rpc = ScriptedRpc()
+    queue_computed_name_preview(rpc)
+    queue_computed_name_preview(rpc)
+    rpc.queue("ir.model.fields", "write", True)
+    rpc.queue("ir.model.fields", "search_read", [{**computed_name_field(), **computed_name_spec()}])
+    args = arguments(tmp_path)
+    args.command, args.model, args.name = "field-update", "x_document", "x_name"
+    client = schema.SchemaClient(*rpc.connection())
+    plan = schema.build_plan(client, args, computed_name_spec())
+    assert not rpc.mutations
+    journal = schema.apply_plan(client, args, plan)
+    assert journal["status"] == "verified"
+    assert len(rpc.mutations) == 1
+    assert rpc.mutations[0].args == [[2], computed_name_spec()]
+    assert all(
+        call.kwargs == {"context": {"active_test": False}}
+        for call in rpc.calls
+        if call.method == "search_count"
+    )
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_computed_name_refuses_existing_records(tmp_path: Path, stale: bool) -> None:
+    rpc = ScriptedRpc()
+    queue_computed_name_preview(rpc, records=0 if stale else 1)
+    args = arguments(tmp_path)
+    args.command, args.model, args.name = "field-update", "x_document", "x_name"
+    client = schema.SchemaClient(*rpc.connection())
+    if stale:
+        plan = schema.build_plan(client, args, computed_name_spec())
+        queue_computed_name_preview(rpc, records=1)
+        with pytest.raises(ValueError, match="populated"):
+            schema.apply_plan(client, args, plan)
+        assert (
+            json.loads((tmp_path / "journal.json").read_text(encoding="utf-8"))["status"]
+            == "requires_review"
+        )
+    else:
+        with pytest.raises(ValueError, match="populated"):
+            schema.build_plan(client, args, computed_name_spec())
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"readonly": False}, "readonly=true"),
+        ({"copied": True}, "copied=false"),
+        ({"compute": "for:"}, "invalid syntax"),
+        ({"compute": "   "}, "nonempty"),
+        ({"depends": "x_name"}, "themselves"),
+        ({"depends": "x_date;import os"}, "field paths"),
+    ],
+)
+def test_computed_name_rejects_unsafe_settings(
+    tmp_path: Path, changes: RpcRecord, message: str
+) -> None:
+    rpc = ScriptedRpc()
+    rpc.queue("ir.model", "search_read", [{"id": 1, "model": "x_document", "state": "manual"}])
+    rpc.queue("ir.model.fields", "search_read", [computed_name_field()])
+    args = arguments(tmp_path)
+    args.command, args.model, args.name = "field-update", "x_document", "x_name"
+    with pytest.raises((ValueError, SyntaxError), match=message):
+        schema.build_plan(
+            schema.SchemaClient(*rpc.connection()), args, {**computed_name_spec(), **changes}
+        )
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
+def test_computed_name_readback_mismatch_retains_review_journal(tmp_path: Path) -> None:
+    rpc = ScriptedRpc()
+    queue_computed_name_preview(rpc)
+    queue_computed_name_preview(rpc)
+    rpc.queue("ir.model.fields", "write", True)
+    rpc.queue(
+        "ir.model.fields",
+        "search_read",
+        [{**computed_name_field(), **computed_name_spec(), "compute": "different"}],
+    )
+    args = arguments(tmp_path)
+    args.command, args.model, args.name = "field-update", "x_document", "x_name"
+    client = schema.SchemaClient(*rpc.connection())
+    plan = schema.build_plan(client, args, computed_name_spec())
+    with pytest.raises(ValueError, match="compute"):
+        schema.apply_plan(client, args, plan)
+    assert (
+        json.loads((tmp_path / "journal.json").read_text(encoding="utf-8"))["status"]
+        == "requires_review"
+    )
+    assert len(rpc.mutations) == 1
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize(("model", "state"), [("res.partner", "base"), ("x_document", "base")])
+def test_computed_name_refuses_nonmanual_models(tmp_path: Path, model: str, state: str) -> None:
+    rpc = ScriptedRpc()
+    rpc.queue("ir.model", "search_read", [{"id": 1, "model": model, "state": state}])
+    rpc.queue("ir.model.fields", "search_read", [computed_name_field()])
+    args = arguments(tmp_path)
+    args.command, args.model, args.name = "field-update", model, "x_name"
+    with pytest.raises(ValueError, match="manual x_ model"):
+        schema.build_plan(schema.SchemaClient(*rpc.connection()), args, computed_name_spec())
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
 @pytest.mark.parametrize("apply", [False, True])
 def test_schema_cli_accepts_a_provider_without_bypassing_apply_guards(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], apply: bool

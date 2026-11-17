@@ -83,6 +83,30 @@ Field type/relation migrations and removing selection values are refused.
 Deletion requires `--allow-data-loss` and passes dependency checks first.
 Action creation checks code syntax and group access but never executes the action.
 
+An existing `x_name` char field on an empty manual `x_` model can be made a
+stored computed display name with `field-update`. Supply `compute` (reviewed
+Python code), `depends` (comma-separated field paths), `store: true`,
+`readonly: true` and `copied: false`. For example:
+
+```json
+{
+  "compute": "for record in self:\n    record['x_name'] = '%s - %s' % (record['x_date'], record['x_partner_id'].name)",
+  "depends": "x_date,x_partner_id.name",
+  "store": true,
+  "readonly": true,
+  "copied": false
+}
+```
+
+Dependency paths are checked against accessible fields and may traverse only
+Many2one relations. Self-dependencies, computation changes and conversions of
+populated models (including archived records) are refused. Existing computations
+remain read-only, stored and non-copyable. Python syntax is checked locally;
+Odoo validates its safe-eval restrictions when saving. The code runs in Odoo
+when the field is computed; review it before applying. This does not install or
+require an automation module. Native dependency recomputation handles changes to
+the referenced fields. Other computed fields remain outside this utility's scope.
+
 `model-enable-chatter MODEL` enables chatter only on an existing manual `x_`
 model, without a spec. It previews by default and uses the same apply,
 database-confirmation and exclusive-journal requirements. This affects all
