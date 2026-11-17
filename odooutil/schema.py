@@ -1,6 +1,8 @@
 """Manage Odoo schema and record values with preview-first, journaled writes."""
 
 import argparse
+import base64
+import hashlib
 import json
 import logging
 import math
@@ -36,6 +38,7 @@ class SchemaArgs(argparse.Namespace):
     chatter: str = "quiet"
     lang: str | None = None
     allow_automation: bool = False
+    file: Path | None = None
 
     def __init__(self) -> None:
         super().__init__()
@@ -73,7 +76,29 @@ class RecordPlan(TypedDict):
     side_effect_warning: str
 
 
-Plan = ReadPlan | SchemaPlan | RecordPlan
+class AttachmentSource(TypedDict):
+    name: str
+    file_size: int
+    checksum: str
+    sha256: str
+
+
+class AttachmentPlan(TypedDict):
+    action: Literal["create", "reuse"]
+    kind: Literal["attachment"]
+    before: RpcRecord | None
+    rpc_model: str
+    values: RpcRecord
+    requested: None
+    source: AttachmentSource
+    target: RpcRecord
+    context: RpcRecord
+    audit_chatter: bool
+    automation_acknowledged: bool
+    side_effect_warning: str
+
+
+Plan = ReadPlan | SchemaPlan | RecordPlan | AttachmentPlan
 
 
 def object_dict(value: object, message: str = "Expected an object") -> RpcRecord:
@@ -638,6 +663,169 @@ QUIET_CONTEXT = {
     "mail_notify_force_send": False,
 }
 
+MUTATION_WARNING = (
+    "Context suppresses standard chatter only; custom hooks and automation may still run. "
+    "Audits cannot prove no external effects."
+)
+
+
+def mutation_context(client: RpcClient, args: SchemaArgs) -> RpcRecord:
+    if args.chatter == "quiet":
+        automation = client.search(
+            "ir.module.module",
+            [["name", "=", "base_automation"], ["state", "=", "installed"]],
+            ["id"],
+        )
+        require(
+            not automation or args.allow_automation,
+            "Automation is installed; review triggers and use --allow-automation to acknowledge",
+        )
+        return {**QUIET_CONTEXT, "lang": client.context["lang"]}
+    return {"active_test": False, "lang": client.context["lang"]}
+
+
+ATTACHMENT_COLUMNS = [
+    "id",
+    "name",
+    "type",
+    "res_model",
+    "res_id",
+    "res_field",
+    "public",
+    "checksum",
+    "file_size",
+]
+
+
+def attachment_source(path: Path | None) -> tuple[bytes, AttachmentSource]:
+    if path is None:
+        raise ValueError("Attachment upload requires a source file")
+    content = path.read_bytes()
+    require(bool(content), "Attachment source must not be empty")
+    return content, {
+        "name": path.name,
+        "file_size": len(content),
+        "checksum": hashlib.sha1(content).hexdigest(),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+
+
+def attachment_plan(client: RpcClient, args: SchemaArgs) -> AttachmentPlan:
+    require(
+        MODEL_NAME_PATTERN.fullmatch(args.model) is not None
+        and type(args.record_id) is int
+        and args.record_id > 0,
+        "Attachment target needs a model and positive existing record ID",
+    )
+    _, source = attachment_source(args.file)
+    target_fields = object_dict(
+        client.call(
+            args.model,
+            "fields_get",
+            [["id", "write_date", "message_ids"]],
+            attributes=["type"],
+        )
+    )
+    require("id" in target_fields, "Target ID field is inaccessible")
+    target = client.one(
+        args.model,
+        [["id", "=", args.record_id]],
+        ["id", *(["write_date"] if "write_date" in target_fields else [])],
+    )
+    if target is None or target["id"] != args.record_id:
+        raise ValueError("Attachment target does not exist or is inaccessible")
+    fields = object_dict(
+        client.call(
+            "ir.attachment",
+            "fields_get",
+            [[*ATTACHMENT_COLUMNS, "raw"]],
+            attributes=["type", "readonly"],
+        )
+    )
+    require(
+        set(ATTACHMENT_COLUMNS) | {"raw"} <= fields.keys(),
+        "Native attachment metadata or raw upload field is inaccessible",
+    )
+    raw = object_dict(fields["raw"])
+    require(
+        raw.get("type") == "binary" and not raw.get("readonly"),
+        "Native raw binary uploads are not supported by this target",
+    )
+    duplicates = client.search(
+        "ir.attachment",
+        [
+            ["res_model", "=", args.model],
+            ["res_id", "=", args.record_id],
+            ["res_field", "=", False],
+            ["checksum", "=", source["checksum"]],
+        ],
+        ATTACHMENT_COLUMNS,
+        limit=2,
+    )
+    require(len(duplicates) <= 1, "Multiple checksum matches require duplicate review")
+    before = duplicates[0] if duplicates else None
+    require(
+        before is None or before.get("public") is False,
+        "Existing checksum match is public; review its permissions before proceeding",
+    )
+    context = {**mutation_context(client, args), "image_no_postprocess": True}
+    return {
+        "action": "reuse" if before is not None else "create",
+        "kind": "attachment",
+        "rpc_model": "ir.attachment",
+        "before": before,
+        "requested": None,
+        "source": source,
+        "target": target,
+        "values": {
+            "name": source["name"],
+            "type": "binary",
+            "res_model": args.model,
+            "res_id": args.record_id,
+            "public": False,
+        },
+        "context": context,
+        "audit_chatter": args.chatter == "quiet" and "message_ids" in target_fields,
+        "automation_acknowledged": args.allow_automation,
+        "side_effect_warning": MUTATION_WARNING,
+    }
+
+
+def attachment_payload(args: SchemaArgs, plan: AttachmentPlan) -> RpcRecord:
+    content, source = attachment_source(args.file)
+    require(source == plan["source"], "Attachment source changed since preview")
+    return {**plan["values"], "raw": base64.b64encode(content).decode("ascii")}
+
+
+def verify_attachment(
+    client: RpcClient,
+    args: SchemaArgs,
+    plan: AttachmentPlan,
+    result: object,
+) -> RpcRecord:
+    record_id = integer(result, "Unexpected attachment response")
+    after = client.one("ir.attachment", [["id", "=", record_id]], [*ATTACHMENT_COLUMNS, "raw"])
+    if after is None or after["id"] != record_id:
+        raise ValueError("Saved attachment was not found")
+    raw = after.pop("raw")
+    if not isinstance(raw, str):
+        raw = object_dict(raw).get("content")
+    content = base64.b64decode(text(raw, "Attachment content must be base64 text"), validate=True)
+    expected_content, source = attachment_source(args.file)
+    require(source == plan["source"], "Attachment source changed during upload")
+    require(content == expected_content, "Saved attachment bytes mismatch")
+    expected = {
+        **plan["values"],
+        "res_field": False,
+        "checksum": source["checksum"],
+        "file_size": source["file_size"],
+    }
+    if plan["before"] is not None:
+        expected["name"] = plan["before"]["name"]
+    for name, value in expected.items():
+        require(after.get(name) == value, f"Saved attachment setting mismatch: {name}")
+    return after
+
 
 RECORD_TYPES = {
     "char",
@@ -858,27 +1046,7 @@ def record_plan(client: RpcClient, args: SchemaArgs, spec: RpcRecord | None) -> 
                     f"Expected current value mismatch: {name} (record {row['id']})",
                 )
         before = records if batch else records[0]
-    context = (
-        {**QUIET_CONTEXT, "lang": client.context["lang"]}
-        if args.chatter == "quiet"
-        else {
-            "active_test": False,
-            "lang": client.context["lang"],
-        }
-    )
-    if args.chatter == "quiet":
-        automation = client.search(
-            "ir.module.module",
-            [
-                ["name", "=", "base_automation"],
-                ["state", "=", "installed"],
-            ],
-            ["id"],
-        )
-        require(
-            not automation or args.allow_automation,
-            "Automation is installed; review triggers and use --allow-automation to acknowledge",
-        )
+    context = mutation_context(client, args)
     return {
         "action": "create" if creating else "update",
         "kind": "records" if batch else "record",
@@ -891,8 +1059,7 @@ def record_plan(client: RpcClient, args: SchemaArgs, spec: RpcRecord | None) -> 
         "context": context,
         "audit_chatter": args.chatter == "quiet" and "message_ids" in fields,
         "automation_acknowledged": args.allow_automation,
-        "side_effect_warning": "Context suppresses standard chatter only; custom hooks and "
-        "automation may still run. Audits cannot prove no external effects.",
+        "side_effect_warning": MUTATION_WARNING,
     }
 
 
@@ -917,6 +1084,9 @@ logger = logging.getLogger(__name__)
 
 
 def build_plan(client: SchemaClient, args: SchemaArgs, spec: RpcRecord | None) -> Plan:
+    if args.command == "attachment-upload":
+        require(spec is None, "Attachment upload does not accept a spec")
+        return attachment_plan(client, args)
     if args.command in {"record-create", "record-set", "record-set-batch"}:
         return record_plan(client, args, spec)
     if args.command == "model-enable-chatter":
@@ -1118,6 +1288,8 @@ def verify(
 ) -> RpcRecord | list[RpcRecord] | None:
     if plan["action"] == "read":
         raise ValueError("A read plan cannot be verified as a mutation")
+    if plan["kind"] == "attachment":
+        return verify_attachment(client, args, plan, result)
     values = plan["values"]
     requested = plan["requested"] or {}
     if plan["kind"] == "model":
@@ -1285,7 +1457,7 @@ def apply_plan(client: SchemaClient, args: SchemaArgs, plan: Plan) -> RpcRecord:
         if plan.get("audit_chatter"):
             journal["chatter_before"] = (
                 {"mail.message": [], "mail.mail": []}
-                if plan["action"] == "create"
+                if plan["action"] == "create" and plan["kind"] == "record"
                 else chatter_snapshot(client, args)
             )
             save()
@@ -1310,15 +1482,22 @@ def apply_plan(client: SchemaClient, args: SchemaArgs, plan: Plan) -> RpcRecord:
                 for name, value in values.items()
             )
         }
-        if record_rows and len(unchanged) == len(record_rows):
+        if plan["kind"] == "attachment" and plan["before"] is not None:
+            result = plan["before"]["id"]
+            journal["no_change"] = True
+        elif record_rows and len(unchanged) == len(record_rows):
             result = True
             journal["no_change"] = True
         elif plan["action"] == "create":
             result = client.call(
                 plan["rpc_model"],
                 "create",
-                [values],
-                **({"context": plan["context"]} if plan["kind"] == "record" else {}),
+                [attachment_payload(args, plan) if plan["kind"] == "attachment" else values],
+                **(
+                    {"context": plan["context"]}
+                    if plan["kind"] == "record" or plan["kind"] == "attachment"
+                    else {}
+                ),
             )
             require(type(result) is int and result > 0, "Unexpected create response")
         else:
@@ -1347,7 +1526,9 @@ def apply_plan(client: SchemaClient, args: SchemaArgs, plan: Plan) -> RpcRecord:
             journal["chatter_after"] = chatter_snapshot(
                 client,
                 args,
-                record_id=integer(result) if plan["action"] == "create" else None,
+                record_id=integer(result)
+                if plan["action"] == "create" and plan["kind"] == "record"
+                else None,
             )
             save()
             require(
@@ -1414,6 +1595,18 @@ def parse_args(argv: Sequence[str] | None = None) -> SchemaArgs:
     chatter.add_argument("--apply", action="store_true")
     chatter.add_argument("--confirm-db")
     chatter.add_argument("--journal", type=Path)
+    upload = commands.add_parser(
+        "attachment-upload",
+        help="Upload or reuse a private attachment on an existing record",
+    )
+    upload.add_argument("model")
+    upload.add_argument("record_id", type=int)
+    upload.add_argument("--file", type=Path, required=True)
+    upload.add_argument("--chatter", choices=("quiet", "normal"), default="quiet")
+    upload.add_argument("--allow-automation", action="store_true")
+    upload.add_argument("--apply", action="store_true")
+    upload.add_argument("--confirm-db")
+    upload.add_argument("--journal", type=Path)
     record = commands.add_parser("record-set", help="Set values on one existing record")
     record.add_argument("model")
     record.add_argument("record_id", type=int)
@@ -1469,7 +1662,7 @@ def parse_args(argv: Sequence[str] | None = None) -> SchemaArgs:
             parser.error("Batch requires 1-1000 unique positive record IDs")
         args.record_ids.sort()
         args.name = ",".join(map(str, args.record_ids))
-    if args.command == "record-set":
+    if args.command in {"record-set", "attachment-upload"}:
         if args.record_id <= 0:
             parser.error("record_id must be positive")
         args.name = str(args.record_id)

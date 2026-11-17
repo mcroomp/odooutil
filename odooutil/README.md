@@ -72,6 +72,7 @@ Supported commands:
 | Contextual server-action definitions | `action-create`, `action-read` |
 | New scalar/Many2one/JSON records | `record-create` |
 | Existing scalar/Many2one/JSON record values | `record-set`, `record-set-batch` |
+| Private attachments on existing records | `attachment-upload` |
 
 Schema specs use native Odoo names. Manual model/field names require `x_`.
 Model creation needs explicit `access` rules with name, positive verified
@@ -101,11 +102,11 @@ Python code), `depends` (comma-separated field paths), `store: true`,
 Dependency paths are checked against accessible fields and may traverse only
 Many2one relations. Self-dependencies, computation changes and conversions of
 populated models (including archived records) are refused. Existing computations
-remain read-only, stored and non-copyable. Python syntax is checked locally;
-the computed name must not have `required: true`: manual computations are not
+remain read-only, stored and non-copyable. The computed name must not have
+`required: true`: manual computations are not
 precomputed, so Odoo can reject creation before generating the name. Make the
-source fields required instead.
-Odoo validates its safe-eval restrictions when saving. The code runs in Odoo
+source fields required instead. Python syntax is checked locally; Odoo validates
+its safe-eval restrictions when saving. The code runs in Odoo
 when the field is computed; review it before applying. This does not install or
 require an automation module. Native dependency recomputation handles changes to
 the referenced fields. Other computed fields remain outside this utility's scope.
@@ -120,6 +121,41 @@ Adding `<chatter/>` to the form is a separate `view-create` operation using an
 inherited view; separate operations are not atomic. If the view step fails,
 the model remains chatter-enabled. Inspect the journals before taking further
 action; do not retry an uncertain mutation.
+
+### Original attachments
+
+`attachment-upload MODEL ID --file FILE` previews a private binary attachment
+on an existing, accessible record. It requires the native writable `ir.attachment.raw`
+field and a nonempty local file; there is no spec or public-upload option.
+
+```bash
+odoo-schema --target-url https://example.odoo.com --target-db example \
+  attachment-upload res.partner 123 --file ./evidence.pdf
+```
+
+After reviewing the preview, add `--apply --confirm-db example --journal NEW_FILE`.
+The command rechecks the target (including `write_date` when available), file
+digests and duplicate scope immediately before applying. Matching checksums are
+scoped to ordinary attachments on that target, not other records or binary fields.
+One existing private match produces a verified `reuse` with no write and retains
+its filename. Multiple matches or a public match require review.
+
+New uploads use the original basename, `public: false` and native
+`image_no_postprocess` context to avoid image resizing. Readback verifies the
+target, filename, privacy, size, native SHA-1 checksum and exact original bytes.
+Both native binary readback forms (base64 text and an object containing `content`)
+are supported. Previews and private journals contain metadata and digests, never
+the file bytes or base64 payload.
+
+Quiet mode is the default, with the same automation acknowledgement and linked
+chatter/mail audits as record changes. Audits concern the existing target, not
+the new attachment ID. Creating a parent record and attaching a file are separate
+transactions; this command neither creates the parent nor changes its schema or
+primary-attachment selection. A failed/uncertain upload retains a review journal:
+inspect live state before retrying; no automatic retry or rollback is attempted.
+Source files and target records are not locked against concurrent changes.
+
+### Record values
 
 Record specs contain `values` and optional recommended `expected` guards:
 

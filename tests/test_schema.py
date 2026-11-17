@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -793,4 +795,296 @@ def test_enable_chatter_failures_require_review_without_retry(tmp_path: Path, fa
     journal = json.loads((tmp_path / "journal.json").read_text(encoding="utf-8"))
     assert journal["status"] == "requires_review"
     assert len(rpc.mutations) == (0 if failure == "stale" else 1)
+    rpc.assert_complete()
+
+
+def attachment_arguments(tmp_path: Path) -> schema.SchemaArgs:
+    args = arguments(tmp_path)
+    args.command, args.model, args.record_id = "attachment-upload", "res.partner", 9
+    args.file = tmp_path / "evidence.pdf"
+    args.file.write_bytes(b"%PDF-1.7\nsynthetic attachment, no personal data\n")
+    return args
+
+
+def attachment_row(args: schema.SchemaArgs, *, duplicate: bool = False) -> RpcRecord:
+    assert args.file is not None
+    content = args.file.read_bytes()
+    return {
+        "id": 42,
+        "name": "existing.pdf" if duplicate else args.file.name,
+        "type": "binary",
+        "res_model": "res.partner",
+        "res_id": 9,
+        "res_field": False,
+        "public": False,
+        "checksum": hashlib.sha1(content).hexdigest(),
+        "file_size": len(content),
+    }
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_attachment_source_refuses_missing_or_empty_files(tmp_path: Path, missing: bool) -> None:
+    rpc = ScriptedRpc()
+    args = attachment_arguments(tmp_path)
+    assert args.file is not None
+    if missing:
+        args.file.unlink()
+    else:
+        args.file.write_bytes(b"")
+    with pytest.raises((FileNotFoundError, ValueError)):
+        schema.build_plan(schema.SchemaClient(*rpc.connection()), args, None)
+    assert not rpc.calls
+    rpc.assert_complete()
+
+
+def queue_attachment_preview(
+    rpc: ScriptedRpc,
+    args: schema.SchemaArgs,
+    *,
+    duplicate: bool = False,
+    changed_target: bool = False,
+    failure: str | None = None,
+) -> None:
+    rpc.queue(
+        "res.partner",
+        "fields_get",
+        {
+            "id": {"type": "integer"},
+            "write_date": {"type": "datetime"},
+            "message_ids": {"type": "one2many"},
+        },
+    )
+    rpc.queue(
+        "res.partner",
+        "search_read",
+        []
+        if failure == "missing"
+        else [
+            {
+                "id": 9,
+                "write_date": "2026-01-02 00:00:00" if changed_target else "2026-01-01 00:00:00",
+            }
+        ],
+    )
+    if failure == "missing":
+        return
+    rpc.queue(
+        "ir.attachment",
+        "fields_get",
+        {
+            **{name: {"type": "char"} for name in schema.ATTACHMENT_COLUMNS},
+            "raw": {"type": "char" if failure == "unsupported" else "binary", "readonly": False},
+        },
+    )
+    if failure == "unsupported":
+        return
+    row = attachment_row(args, duplicate=duplicate)
+    if failure == "public":
+        row["public"] = True
+    rpc.queue(
+        "ir.attachment",
+        "search_read",
+        [row, {**row, "id": 43}]
+        if failure == "multiple"
+        else [row]
+        if duplicate or failure == "public"
+        else [],
+    )
+    if failure in {"public", "multiple"}:
+        return
+    rpc.queue("ir.module.module", "search_read", [{"id": 1}] if failure == "automation" else [])
+
+
+def queue_attachment_audit(rpc: ScriptedRpc, *, changed: bool = False) -> None:
+    rpc.queue("mail.message", "search_read", [{"id": 99 if changed else 15}])
+    rpc.queue("mail.mail", "search_read", [])
+
+
+@pytest.mark.parametrize(
+    ("apply", "duplicate", "structured"),
+    [(False, False, True), (False, True, True), (True, False, True), (True, True, False)],
+)
+def test_attachment_cli_private_upload_or_checksum_reuse(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    apply: bool,
+    duplicate: bool,
+    structured: bool,
+) -> None:
+    rpc = ScriptedRpc()
+    args = attachment_arguments(tmp_path)
+    assert args.file is not None
+    encoded = base64.b64encode(args.file.read_bytes()).decode("ascii")
+    for _ in range(2 if apply else 1):
+        queue_attachment_preview(rpc, args, duplicate=duplicate)
+    if apply:
+        queue_attachment_audit(rpc)
+        if not duplicate:
+            rpc.queue("ir.attachment", "create", 42)
+        rpc.queue(
+            "ir.attachment",
+            "search_read",
+            [
+                {
+                    **attachment_row(args, duplicate=duplicate),
+                    "raw": {"content": encoded, "size": args.file.stat().st_size}
+                    if structured
+                    else encoded,
+                }
+            ],
+        )
+        queue_attachment_audit(rpc)
+    argv = [
+        "--target-url",
+        args.target_url,
+        "--target-db",
+        args.target_db,
+        "attachment-upload",
+        args.model,
+        "9",
+        "--file",
+        str(args.file),
+    ]
+    if apply:
+        for options in (
+            ["--apply"],
+            ["--apply", "--confirm-db", "wrong", "--journal", str(args.journal)],
+        ):
+            with pytest.raises(SystemExit):
+                schema.main([*argv, *options], connection_provider=rpc.connection)
+            assert not rpc.calls
+        argv += ["--apply", "--confirm-db", args.target_db, "--journal", str(args.journal)]
+    schema.main(argv, connection_provider=rpc.connection)
+    output = json.loads(capsys.readouterr().out)
+    assert len(rpc.mutations) == (1 if apply and not duplicate else 0)
+    duplicate_checks = [
+        call
+        for call in rpc.calls
+        if call.model == "ir.attachment"
+        and call.method == "search_read"
+        and ["res_id", "=", 9] in schema.object_list(call.args[0])
+    ]
+    assert duplicate_checks
+    if apply:
+        assert output["status"] == "verified" and output["result"] == 42
+        assert bool(output.get("no_change")) == duplicate
+        assert output["after"]["name"] == ("existing.pdf" if duplicate else args.file.name)
+        assert (
+            output["chatter_before"]
+            == output["chatter_after"]
+            == {
+                "mail.message": [15],
+                "mail.mail": [],
+            }
+        )
+        audits = [call for call in rpc.calls if call.model in {"mail.message", "mail.mail"}]
+        assert all(
+            call.args == [[["model", "=", "res.partner"], ["res_id", "in", [9]]]] for call in audits
+        )
+        journal_path = tmp_path / "journal.json"
+        saved = journal_path.read_text(encoding="utf-8")
+        assert json.loads(saved) == output and encoded not in saved and '"raw":' not in saved
+        if os.name == "posix":
+            assert journal_path.stat().st_mode & 0o777 == 0o600
+        if not duplicate:
+            assert rpc.mutations[0].args == [
+                {
+                    "name": args.file.name,
+                    "type": "binary",
+                    "res_model": "res.partner",
+                    "res_id": 9,
+                    "public": False,
+                    "raw": encoded,
+                }
+            ]
+            assert rpc.mutations[0].kwargs["context"] == {
+                **schema.QUIET_CONTEXT,
+                "lang": "en_US",
+                "image_no_postprocess": True,
+            }
+    else:
+        assert output["applied"] is False
+        assert output["action"] == ("reuse" if duplicate else "create")
+        assert output["values"]["public"] is False
+        assert encoded not in json.dumps(output) and '"raw":' not in json.dumps(output)
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize("failure", ["missing", "unsupported", "public", "multiple", "automation"])
+def test_attachment_preview_refuses_unsafe_targets_without_writes(
+    tmp_path: Path, failure: str
+) -> None:
+    rpc = ScriptedRpc()
+    args = attachment_arguments(tmp_path)
+    queue_attachment_preview(rpc, args, failure=failure)
+    with pytest.raises(ValueError):
+        schema.build_plan(schema.SchemaClient(*rpc.connection()), args, None)
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize("change", ["target", "file", "duplicate"])
+def test_attachment_apply_rechecks_source_target_and_duplicates(
+    tmp_path: Path, change: str
+) -> None:
+    rpc = ScriptedRpc()
+    args = attachment_arguments(tmp_path)
+    queue_attachment_preview(rpc, args)
+    client = schema.SchemaClient(*rpc.connection())
+    plan = schema.build_plan(client, args, None)
+    if change == "file":
+        assert args.file is not None
+        args.file.write_bytes(b"changed after preview")
+    queue_attachment_preview(
+        rpc,
+        args,
+        changed_target=change == "target",
+        duplicate=change == "duplicate",
+    )
+    with pytest.raises(ValueError, match="changed since preview"):
+        schema.apply_plan(client, args, plan)
+    assert not rpc.mutations
+    assert (
+        json.loads((tmp_path / "journal.json").read_text(encoding="utf-8"))["status"]
+        == "requires_review"
+    )
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize("failure", ["lost_response", "bytes", "owner", "public", "chatter"])
+def test_attachment_failures_require_review_without_retry(tmp_path: Path, failure: str) -> None:
+    rpc = ScriptedRpc()
+    args = attachment_arguments(tmp_path)
+    assert args.file is not None
+    for _ in range(2):
+        queue_attachment_preview(rpc, args)
+    queue_attachment_audit(rpc)
+    rpc.queue(
+        "ir.attachment",
+        "create",
+        RuntimeError("Unknown upload outcome") if failure == "lost_response" else 42,
+    )
+    if failure != "lost_response":
+        row = {
+            **attachment_row(args),
+            "raw": {
+                "content": base64.b64encode(
+                    b"changed by server" if failure == "bytes" else args.file.read_bytes()
+                ).decode("ascii")
+            },
+        }
+        if failure == "owner":
+            row["res_id"] = 10
+        if failure == "public":
+            row["public"] = True
+        rpc.queue("ir.attachment", "search_read", [row])
+        if failure == "chatter":
+            queue_attachment_audit(rpc, changed=True)
+    client = schema.SchemaClient(*rpc.connection())
+    plan = schema.build_plan(client, args, None)
+    with pytest.raises((ValueError, RuntimeError)):
+        schema.apply_plan(client, args, plan)
+    journal = json.loads((tmp_path / "journal.json").read_text(encoding="utf-8"))
+    assert journal["status"] == "requires_review"
+    assert len(rpc.mutations) == 1 and rpc.mutations[0].method == "create"
     rpc.assert_complete()
