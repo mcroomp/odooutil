@@ -66,10 +66,11 @@ Supported commands:
 
 | Resource | Commands |
 | --- | --- |
-| Manual models with explicit group ACLs | `model-create`, `model-read` |
+| Manual models with explicit group ACLs | `model-create`, `model-read`, `model-enable-chatter` |
 | Manual fields | `field-create`, `field-read`, `field-update`, `field-delete` |
 | Inherited views and manual-model form/list views | `view-create`, `view-read`, `view-update`, `view-delete` |
 | Contextual server-action definitions | `action-create`, `action-read` |
+| New scalar/Many2one/JSON records | `record-create` |
 | Existing scalar/Many2one/JSON record values | `record-set`, `record-set-batch` |
 
 Schema specs use native Odoo names. Manual model/field names require `x_`.
@@ -82,23 +83,50 @@ Field type/relation migrations and removing selection values are refused.
 Deletion requires `--allow-data-loss` and passes dependency checks first.
 Action creation checks code syntax and group access but never executes the action.
 
+`model-enable-chatter MODEL` enables chatter only on an existing manual `x_`
+model, without a spec. It previews by default and uses the same apply,
+database-confirmation and exclusive-journal requirements. This affects all
+records of the model and Odoo does not permit disabling it afterwards.
+Activities and access rules are not changed. Readback verifies the model flag,
+unchanged model settings and the native message/follower relation fields.
+Adding `<chatter/>` to the form is a separate `view-create` operation using an
+inherited view; separate operations are not atomic. If the view step fails,
+the model remains chatter-enabled. Inspect the journals before taking further
+action; do not retry an uncertain mutation.
+
 Record specs contain `values` and optional recommended `expected` guards:
 
 ```json
 {"values": {"x_reference": "external-123"}, "expected": {"x_reference": false}}
 ```
 
+`record-create MODEL --spec FILE` creates one record. Its spec accepts only
+nonempty `values`, not `expected` guards:
+
+```json
+{"values": {"name": "Example partner", "x_reference": "external-123"}}
+```
+
+It previews without creating anything. Applying uses the same `--apply`,
+`--confirm-db` and new private `--journal` requirements. Omitted fields use
+Odoo's server defaults; required fields without defaults must be supplied.
+The journal records the returned ID and readback verifies the supplied values.
+Creation is not an upsert and does not deduplicate records: after an uncertain
+outcome, inspect the journal and live state instead of retrying.
+
 `record-set MODEL ID` updates one record. `record-set-batch MODEL ID...` assigns
 identical values to 1-1000 unique positive IDs with one write. Writable scalar
-fields, Many2one IDs and JSON objects are supported; binary, x2many, readonly,
+fields, Many2one IDs and JSON objects are supported for both creation and updates;
+binary, x2many, readonly,
 non-stored, related and system/chatter fields are refused. Dates use YYYY-MM-DD;
 datetimes use YYYY-MM-DD HH:MM:SS in UTC. Use native `false`, not null, to clear
-optional values. `--lang CODE` selects an installed language for record writes.
+optional values. `--lang CODE` selects an installed language for record mutations.
 
 Quiet chatter is the default, not a bypass for server hooks. Installed automation
 requires explicit reviewed `--allow-automation`; `--chatter normal` opts into
-normal tracking. Linked chatter/mail is audited where supported, with bounded
-reads; audits cannot prove the absence of external effects. No-op record updates
+normal tracking. Linked chatter/mail is audited where supported (including on
+the new record after creation), with bounded reads; audits cannot prove the
+absence of external effects. No-op record updates
 are journaled without a write. Failures retain `requires_review` journals and do
 not trigger automatic destructive rollback or retry.
 
@@ -145,3 +173,18 @@ Credentials use environment variables or an explicit `--key-file`; see the
 [repository guide](../README.md). Never commit credentials, private specs or
 recovery journals. CLI commands are also available as `python -m odooutil.NAME`;
 `python -m odooutil` defaults to schema administration.
+
+## Sensitive output
+
+Preview and apply JSON output includes supplied values and readback data; journals
+also retain plans, before/after values and record identifiers. Treat this output
+as private, including terminal scrollback and redirected files. Do not send it to
+shared CI logs or commit it. Journal contents are not encrypted; owner-only POSIX
+permissions do not protect copied files or other platforms.
+
+Schema failure logs include operation metadata, identifiers, journal paths and
+the exception type, not exception messages or tracebacks. Original exceptions
+still propagate to callers, so unhandled CLI errors and server errors can contain
+record data. Protect stderr as well as stdout. Quiet chatter is not a privacy
+boundary: server hooks and acknowledged automation can still send notifications
+or disclose supplied values.

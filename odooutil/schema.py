@@ -10,7 +10,7 @@ import sys
 from collections.abc import Sequence
 from datetime import date, datetime
 from pathlib import Path
-from typing import Literal, TypedDict, TypeGuard
+from typing import Literal, NotRequired, TypedDict, TypeGuard
 from urllib.parse import urlsplit
 from xml.etree import ElementTree
 
@@ -55,10 +55,11 @@ class SchemaPlan(TypedDict):
     rpc_model: str
     values: RpcRecord
     requested: RpcRecord | None
+    side_effect_warning: NotRequired[str]
 
 
 class RecordPlan(TypedDict):
-    action: Literal["update"]
+    action: Literal["create", "update"]
     kind: Literal["record", "records"]
     before: RpcRecord | list[RpcRecord] | None
     rpc_model: str
@@ -174,6 +175,14 @@ FIELD_COLUMNS = [
 
 
 MODEL_COLUMNS = ["id", "name", "model", "state", "access_ids"]
+
+CHATTER_MODEL_COLUMNS = [*MODEL_COLUMNS, "is_mail_thread", "is_mail_activity"]
+
+CHATTER_RELATIONS = {
+    "message_ids": ("one2many", "mail.message"),
+    "message_follower_ids": ("one2many", "mail.followers"),
+    "message_partner_ids": ("many2many", "res.partner"),
+}
 
 
 ACCESS_COLUMNS = ["id", "name", "group_id", "perm_read", "perm_write", "perm_create", "perm_unlink"]
@@ -659,7 +668,7 @@ def record_plan(client: RpcClient, args: SchemaArgs, spec: RpcRecord | None) -> 
             "ir.ui.view",
             "ir.model.data",
         },
-        "Use field/view CRUD for schema metadata, not record-set",
+        "Use field/view CRUD for schema metadata, not record commands",
     )
     if getattr(args, "lang", None) is not None:
         require(
@@ -670,8 +679,14 @@ def record_plan(client: RpcClient, args: SchemaArgs, spec: RpcRecord | None) -> 
             is not None,
             f"Language is not installed or accessible: {args.lang}",
         )
-    if not isinstance(spec, dict) or spec.keys() - {"values", "expected"}:
-        raise ValueError("Record spec supports only values and expected")
+    creating = args.command == "record-create"
+    allowed = {"values"} if creating else {"values", "expected"}
+    if not isinstance(spec, dict) or spec.keys() - allowed:
+        raise ValueError(
+            "Record creation spec supports only values"
+            if creating
+            else "Record spec supports only values and expected"
+        )
     values = spec.get("values")
     expected = spec.get("expected", {})
     values = object_dict(values, "values must be a nonempty object")
@@ -738,17 +753,19 @@ def record_plan(client: RpcClient, args: SchemaArgs, spec: RpcRecord | None) -> 
     if "write_date" in fields:
         columns.append("write_date")
     batch = args.command == "record-set-batch"
-    ids = args.record_ids if batch else [args.record_id]
-    records = client.search(args.model, [["id", "in", ids]], columns, limit=len(ids) + 1)
-    require([row["id"] for row in records] == ids, "Record does not exist or is inaccessible")
-    for row in records:
-        for name, value in expected.items():
-            require(
-                record_value(fields[name], row[name], reading=True)
-                == record_value(fields[name], value),
-                f"Expected current value mismatch: {name} (record {row['id']})",
-            )
-    before: RpcRecord | list[RpcRecord] = records if batch else records[0]
+    before: RpcRecord | list[RpcRecord] | None = None
+    if not creating:
+        ids = args.record_ids if batch else [args.record_id]
+        records = client.search(args.model, [["id", "in", ids]], columns, limit=len(ids) + 1)
+        require([row["id"] for row in records] == ids, "Record does not exist or is inaccessible")
+        for row in records:
+            for name, value in expected.items():
+                require(
+                    record_value(fields[name], row[name], reading=True)
+                    == record_value(fields[name], value),
+                    f"Expected current value mismatch: {name} (record {row['id']})",
+                )
+        before = records if batch else records[0]
     context = (
         {**QUIET_CONTEXT, "lang": client.context["lang"]}
         if args.chatter == "quiet"
@@ -771,7 +788,7 @@ def record_plan(client: RpcClient, args: SchemaArgs, spec: RpcRecord | None) -> 
             "Automation is installed; review triggers and use --allow-automation to acknowledge",
         )
     return {
-        "action": "update",
+        "action": "create" if creating else "update",
         "kind": "records" if batch else "record",
         "rpc_model": args.model,
         "before": before,
@@ -787,10 +804,16 @@ def record_plan(client: RpcClient, args: SchemaArgs, spec: RpcRecord | None) -> 
     }
 
 
-def chatter_snapshot(client: RpcClient, args: SchemaArgs) -> dict[str, list[int]]:
+def chatter_snapshot(
+    client: RpcClient, args: SchemaArgs, *, record_id: int | None = None
+) -> dict[str, list[int]]:
     snapshot: dict[str, list[int]] = {}
     for model in ("mail.message", "mail.mail"):
-        ids = args.record_ids if args.command == "record-set-batch" else [args.record_id]
+        ids = (
+            args.record_ids
+            if args.command == "record-set-batch"
+            else [args.record_id if record_id is None else record_id]
+        )
         domain = [["model", "=", args.model], ["res_id", "in", ids]]
         records = client.search(model, domain, ["id"], limit=1001)
         require(len(records) <= 1000, f"{model} exceeds the chatter audit limit")
@@ -802,8 +825,33 @@ logger = logging.getLogger(__name__)
 
 
 def build_plan(client: SchemaClient, args: SchemaArgs, spec: RpcRecord | None) -> Plan:
-    if args.command in {"record-set", "record-set-batch"}:
+    if args.command in {"record-create", "record-set", "record-set-batch"}:
         return record_plan(client, args, spec)
+    if args.command == "model-enable-chatter":
+        require(spec is None, "Enabling chatter does not accept a spec")
+        require(
+            re.fullmatch(r"x_[a-z][a-z0-9_]*", args.model) is not None,
+            "Chatter can be enabled only on manual x_ models",
+        )
+        before = client.one("ir.model", [["model", "=", args.model]], CHATTER_MODEL_COLUMNS)
+        require(
+            before is not None and before["state"] == "manual",
+            "Chatter can be enabled only on an existing manual x_ model",
+        )
+        if before is None:
+            raise ValueError(f"Model does not exist: {args.model}")
+        require(before["is_mail_thread"] is False, "Chatter is already enabled or unavailable")
+        return {
+            "action": "update",
+            "kind": "model",
+            "rpc_model": "ir.model",
+            "before": before,
+            "values": {"is_mail_thread": True},
+            "requested": None,
+            "side_effect_warning": "Enabling chatter affects all records and cannot be disabled "
+            "through Odoo's model settings. Activities and access rules are unchanged. "
+            "Add a chatter element through a separate inherited form view.",
+        }
     kind, action = args.command.split("-")
     if action not in ("read", "create", "update", "delete"):
         raise ValueError(f"Unknown schema action: {action}")
@@ -974,6 +1022,30 @@ def verify(
     values = plan["values"]
     requested = plan["requested"] or {}
     if plan["kind"] == "model":
+        if args.command == "model-enable-chatter":
+            before = object_dict(plan["before"])
+            after = client.one("ir.model", [["model", "=", args.model]], CHATTER_MODEL_COLUMNS)
+            if after is None:
+                raise ValueError("Saved model was not found")
+            for key in (*MODEL_COLUMNS, "is_mail_activity"):
+                require(after[key] == before[key], f"Saved model setting changed: {key}")
+            require(after["is_mail_thread"] is True, "Chatter was not enabled")
+            fields = object_dict(
+                client.call(
+                    args.model,
+                    "fields_get",
+                    [list(CHATTER_RELATIONS)],
+                    attributes=["type", "relation"],
+                )
+            )
+            for name, (kind, relation) in CHATTER_RELATIONS.items():
+                require(name in fields, f"Chatter field was not created: {name}")
+                field = object_dict(fields[name])
+                require(
+                    field.get("type") == kind and field.get("relation") == relation,
+                    f"Chatter field schema mismatch: {name}",
+                )
+            return after
         after = client.one("ir.model", [["model", "=", args.model]], MODEL_COLUMNS)
         if after is None or after["id"] != result:
             raise ValueError("Saved model ID mismatch")
@@ -1016,7 +1088,13 @@ def verify(
                 require(actual == value, f"Saved action setting mismatch: {name}")
         return after
     if plan["kind"] == "record" or plan["kind"] == "records":
-        ids = args.record_ids if plan["kind"] == "records" else [args.record_id]
+        ids = (
+            [integer(result, "Unexpected create response")]
+            if plan["action"] == "create"
+            else args.record_ids
+            if plan["kind"] == "records"
+            else [args.record_id]
+        )
         records = client.search(
             args.model, [["id", "in", ids]], plan["columns"], limit=len(ids) + 1
         )
@@ -1106,7 +1184,11 @@ def apply_plan(client: SchemaClient, args: SchemaArgs, plan: Plan) -> RpcRecord:
         current = build_plan(client, args, plan["requested"])
         require(current == plan, "Schema or record changed since preview; rerun with a new journal")
         if plan.get("audit_chatter"):
-            journal["chatter_before"] = chatter_snapshot(client, args)
+            journal["chatter_before"] = (
+                {"mail.message": [], "mail.mail": []}
+                if plan["action"] == "create"
+                else chatter_snapshot(client, args)
+            )
             save()
         journal["status"] = "write_started"
         save()
@@ -1116,7 +1198,7 @@ def apply_plan(client: SchemaClient, args: SchemaArgs, plan: Plan) -> RpcRecord:
                 if plan["kind"] == "records"
                 else [object_dict(plan["before"])]
             )
-            if plan["kind"] in {"record", "records"}
+            if plan["kind"] in {"record", "records"} and plan["action"] != "create"
             else []
         )
         values = plan["values"]
@@ -1133,7 +1215,12 @@ def apply_plan(client: SchemaClient, args: SchemaArgs, plan: Plan) -> RpcRecord:
             result = True
             journal["no_change"] = True
         elif plan["action"] == "create":
-            result = client.call(plan["rpc_model"], "create", [values])
+            result = client.call(
+                plan["rpc_model"],
+                "create",
+                [values],
+                **({"context": plan["context"]} if plan["kind"] == "record" else {}),
+            )
             require(type(result) is int and result > 0, "Unexpected create response")
         else:
             result = client.call(
@@ -1158,7 +1245,11 @@ def apply_plan(client: SchemaClient, args: SchemaArgs, plan: Plan) -> RpcRecord:
         save()
         journal["after"] = verify(client, args, plan, result)
         if plan.get("audit_chatter"):
-            journal["chatter_after"] = chatter_snapshot(client, args)
+            journal["chatter_after"] = chatter_snapshot(
+                client,
+                args,
+                record_id=integer(result) if plan["action"] == "create" else None,
+            )
             save()
             require(
                 journal["chatter_after"] == journal["chatter_before"],
@@ -1166,15 +1257,16 @@ def apply_plan(client: SchemaClient, args: SchemaArgs, plan: Plan) -> RpcRecord:
             )
         journal["status"] = "verified"
         save()
-    except Exception:
+    except Exception as exc:
         journal["status"] = "requires_review"
         save()
-        logger.exception(
-            "odoo_schema_operation_failed model=%s name=%s journal=%s; "
+        logger.error(
+            "odoo_schema_operation_failed model=%s name=%s journal=%s error_type=%s; "
             "inspect live state before retrying; no automatic destructive rollback",
             args.model,
             args.name,
             args.journal,
+            type(exc).__name__,
         )
         raise
     return journal
@@ -1215,6 +1307,14 @@ def parse_args(argv: Sequence[str] | None = None) -> SchemaArgs:
                     action="store_true",
                     help="Acknowledge irreversible field-data/view deletion",
                 )
+    chatter = commands.add_parser(
+        "model-enable-chatter",
+        help="Irreversibly enable chatter on an existing manual x_ model; preview by default",
+    )
+    chatter.add_argument("model")
+    chatter.add_argument("--apply", action="store_true")
+    chatter.add_argument("--confirm-db")
+    chatter.add_argument("--journal", type=Path)
     record = commands.add_parser("record-set", help="Set values on one existing record")
     record.add_argument("model")
     record.add_argument("record_id", type=int)
@@ -1234,6 +1334,15 @@ def parse_args(argv: Sequence[str] | None = None) -> SchemaArgs:
     record.add_argument("--apply", action="store_true")
     record.add_argument("--confirm-db")
     record.add_argument("--journal", type=Path)
+    create = commands.add_parser("record-create", help="Create one record; preview by default")
+    create.add_argument("model")
+    create.add_argument("--spec", type=Path, required=True, help="JSON object with values")
+    create.add_argument("--chatter", choices=("quiet", "normal"), default="quiet")
+    create.add_argument("--lang", help="Installed language code for reads, writes and verification")
+    create.add_argument("--allow-automation", action="store_true")
+    create.add_argument("--apply", action="store_true")
+    create.add_argument("--confirm-db")
+    create.add_argument("--journal", type=Path)
     batch = commands.add_parser(
         "record-set-batch", help="Set identical values on up to 1000 records"
     )
@@ -1248,6 +1357,8 @@ def parse_args(argv: Sequence[str] | None = None) -> SchemaArgs:
     batch.add_argument("--journal", type=Path)
     args = SchemaArgs()
     parser.parse_args(argv, namespace=args)
+    if args.command in {"model-enable-chatter", "record-create"}:
+        args.name = args.model
     if args.lang is not None and not args.lang.strip():
         parser.error("--lang must not be empty")
     if args.command == "record-set-batch":
