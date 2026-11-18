@@ -10,7 +10,7 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 
 from odoobase import get_odoo_models, record_dict, record_list, search_read, transport
-from odoobase.models.v19_4 import RawPartner
+from odoobase.models.v19_4 import MODELS, RawPartner
 from odoobase.relations import (
     optional_record,
     relation_id_optional,
@@ -33,6 +33,37 @@ def test_extended_native_contract_validates_without_dropping_extra_columns() -> 
         adapter.validate_python({**row, "x_reference": 123})
     with pytest.raises(ValidationError):
         adapter.validate_python({"name": "Missing native identity"})
+
+
+@pytest.mark.parametrize("move_id", [False, None, [12, "Entry"]])
+def test_native_payment_projection_preserves_optional_journal_entry(move_id: object) -> None:
+    adapter = TypeAdapter(MODELS["account.payment"])
+    row = {
+        "id": 1,
+        "amount": 42.0,
+        "state": "paid",
+        "move_id": move_id,
+        "outstanding_account_id": False,
+        "invoice_ids": [12],
+    }
+    assert adapter.validate_python(row) == row
+    with pytest.raises(ValidationError):
+        adapter.validate_python({**row, "invoice_ids": ["12"]})
+    with pytest.raises(ValidationError):
+        adapter.validate_python({**row, "amount": "42.0"})
+
+
+@pytest.mark.parametrize("model", ["account.move", "account.move.line"])
+def test_native_bank_statement_relations_are_validated(model: str) -> None:
+    adapter = TypeAdapter(MODELS[model])
+    row = {"id": 1, "statement_line_id": [2, "Statement item"]}
+    assert adapter.validate_python(row) == row
+    assert adapter.validate_python({"id": 1, "statement_line_id": False}) == {
+        "id": 1,
+        "statement_line_id": False,
+    }
+    with pytest.raises(ValidationError):
+        adapter.validate_python({**row, "statement_line_id": {"id": 2}})
 
 
 @pytest.mark.parametrize("value", [7, [7, "Name"], (7, "Name")])

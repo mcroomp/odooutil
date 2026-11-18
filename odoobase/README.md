@@ -33,6 +33,10 @@ XML-RPC remains the default. Authentication and malformed responses raise.
 Unknown mutation outcomes must be investigated, never blindly retried.
 
 Native record types describe projections: only `id` is universally required.
+`RawPayment` describes `account.payment`, including payments whose `move_id`
+or outstanding account is unset; `invoice_ids` retains its native list of IDs.
+`RawMove` and `RawMoveLine` expose native `statement_line_id` relations for
+bank-statement evidence. These types are included in the version's `MODELS` inventory.
 Fields supplied by optional Odoo modules are not guaranteed on every database.
 No field inventories are fetched automatically, and localization-specific fields
 belong downstream. Decorated contracts preserve extra columns under strict
