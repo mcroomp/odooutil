@@ -28,6 +28,7 @@ class RawMoveLine(TypedDict, total=False):
     journal_id: Relation
     product_id: Relation
     partner_id: Relation
+    statement_line_id: Relation
     asset_ids: list[int]
     tax_ids: list[int]
     analytic_distribution: dict[str, float] | Literal[False]
@@ -75,6 +76,28 @@ class RawMove(TypedDict, total=False):
     deferred_move_ids: list[int]
     deferred_original_move_ids: list[int]
     line_ids: list[int]
+    statement_line_id: Relation
+
+
+@with_config(ConfigDict(strict=True, extra="allow"))
+class RawPayment(TypedDict, total=False):
+    """account.payment, including payments without journal entries."""
+
+    id: Required[int]
+    amount: float
+    date: str | Literal[False]
+    journal_id: Relation
+    partner_id: Relation
+    state: str
+    move_id: Relation
+    outstanding_account_id: Relation
+    payment_reference: str | Literal[False]
+    payment_type: str
+    destination_account_id: Relation
+    currency_id: Relation
+    company_id: Relation
+    invoice_ids: list[int]
+    partner_bank_id: Relation
 
 
 @with_config(ConfigDict(strict=True, extra="allow"))
@@ -304,6 +327,7 @@ MODELS: Mapping[str, type[object]] = MappingProxyType(
         "account.move": RawMove,
         "account.move.line": RawMoveLine,
         "account.partial.reconcile": RawPartialReconcile,
+        "account.payment": RawPayment,
         "account.tax": RawTax,
         "budget.analytic": RawAnalyticBudget,
         "budget.line": RawBudgetLine,
