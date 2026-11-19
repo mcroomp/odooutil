@@ -332,6 +332,254 @@ def test_record_updates_and_noops_keep_expected_value_guards(tmp_path: Path, noo
     rpc.assert_complete()
 
 
+def primary_attachment() -> RpcRecord:
+    return {
+        "id": 42,
+        "name": "proof.pdf",
+        "type": "binary",
+        "res_model": "res.partner",
+        "res_id": 9,
+        "res_field": False,
+        "public": False,
+        "checksum": "synthetic-checksum",
+        "file_size": 100,
+    }
+
+
+def queue_primary_attachment_preview(
+    rpc: ScriptedRpc,
+    *,
+    before: object = False,
+    attachment: RpcRecord | None = None,
+    stop_after_attachment: bool = False,
+) -> None:
+    rpc.queue(
+        "res.partner",
+        "fields_get",
+        {
+            "message_main_attachment_id": {
+                "type": "many2one",
+                "relation": "ir.attachment",
+                "store": True,
+                "readonly": False,
+            },
+            "write_date": {"type": "datetime"},
+            "message_ids": {"type": "one2many"},
+        },
+    )
+    rpc.queue(
+        "ir.attachment", "search_read", [primary_attachment() if attachment is None else attachment]
+    )
+    if stop_after_attachment:
+        return
+    rpc.queue(
+        "res.partner",
+        "search_read",
+        [
+            {
+                "id": 9,
+                "message_main_attachment_id": before,
+                "write_date": "2026-01-01 00:00:00",
+            }
+        ],
+    )
+    rpc.queue("ir.module.module", "search_read", [])
+
+
+@pytest.mark.parametrize(("apply", "noop"), [(False, False), (True, False), (True, True)])
+def test_primary_attachment_is_guarded_journaled_and_verified(
+    tmp_path: Path,
+    apply: bool,
+    noop: bool,
+) -> None:
+    rpc = ScriptedRpc()
+    before: object = [42, "proof.pdf"] if noop else False
+    queue_primary_attachment_preview(rpc, before=before)
+    if apply:
+        queue_primary_attachment_preview(rpc, before=before)
+        queue_attachment_audit(rpc)
+        if not noop:
+            rpc.queue("res.partner", "write", True)
+        rpc.queue(
+            "res.partner",
+            "search_read",
+            [
+                {
+                    "id": 9,
+                    "message_main_attachment_id": [42, "proof.pdf"],
+                    "write_date": "2026-01-01 00:00:00",
+                }
+            ],
+        )
+        rpc.queue("ir.attachment", "search_read", [primary_attachment()])
+        queue_attachment_audit(rpc)
+    args = arguments(tmp_path)
+    args.command, args.record_id = "record-set", 9
+    client = schema.SchemaClient(*rpc.connection())
+    plan = schema.build_plan(
+        client,
+        args,
+        {
+            "values": {"message_main_attachment_id": 42},
+            "expected": {"message_main_attachment_id": 42 if noop else False},
+        },
+    )
+    assert not rpc.mutations
+    assert plan["kind"] == "record"
+    assert plan.get("primary_attachment") == primary_attachment()
+    if apply:
+        journal = schema.apply_plan(client, args, plan)
+        assert journal["status"] == "verified"
+        assert bool(journal.get("no_change")) == noop
+        assert len(rpc.mutations) == (0 if noop else 1)
+        if not noop:
+            assert rpc.mutations[0].args == [[9], {"message_main_attachment_id": 42}]
+            assert rpc.mutations[0].kwargs["context"] == {**schema.QUIET_CONTEXT, "lang": "en_US"}
+        assert json.loads((tmp_path / "journal.json").read_text(encoding="utf-8")) == journal
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"res_model": "account.move"},
+        {"res_id": 10},
+        {"public": True},
+        {"res_field": "image_1920"},
+        {"type": "url"},
+    ],
+)
+def test_primary_attachment_refuses_nonprivate_or_foreign_documents(
+    tmp_path: Path,
+    changes: RpcRecord,
+) -> None:
+    rpc = ScriptedRpc()
+    queue_primary_attachment_preview(
+        rpc,
+        attachment={**primary_attachment(), **changes},
+        stop_after_attachment=True,
+    )
+    args = arguments(tmp_path)
+    args.command, args.record_id = "record-set", 9
+    with pytest.raises(ValueError, match="private binary attachment owned by"):
+        schema.build_plan(
+            schema.SchemaClient(*rpc.connection()),
+            args,
+            {
+                "values": {"message_main_attachment_id": 42},
+                "expected": {"message_main_attachment_id": False},
+            },
+        )
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize(
+    "failure", ["owner", "checksum", "readback", "attachment_readback", "chatter"]
+)
+def test_primary_attachment_failures_retain_review_journals_without_retry(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    rpc = ScriptedRpc()
+    queue_primary_attachment_preview(rpc)
+    changed = primary_attachment()
+    if failure == "owner":
+        changed["res_id"] = 10
+    elif failure == "checksum":
+        changed["checksum"] = "changed-checksum"
+    queue_primary_attachment_preview(
+        rpc,
+        attachment=changed,
+        stop_after_attachment=failure == "owner",
+    )
+    if failure in {"readback", "attachment_readback", "chatter"}:
+        queue_attachment_audit(rpc)
+        rpc.queue("res.partner", "write", True)
+        rpc.queue(
+            "res.partner",
+            "search_read",
+            [
+                {
+                    "id": 9,
+                    "message_main_attachment_id": False
+                    if failure == "readback"
+                    else [42, "proof.pdf"],
+                    "write_date": "2026-01-01 00:00:00",
+                }
+            ],
+        )
+        if failure != "readback":
+            rpc.queue(
+                "ir.attachment",
+                "search_read",
+                [
+                    {**primary_attachment(), "public": True}
+                    if failure == "attachment_readback"
+                    else primary_attachment()
+                ],
+            )
+        if failure == "chatter":
+            queue_attachment_audit(rpc, changed=True)
+    args = arguments(tmp_path)
+    args.command, args.record_id = "record-set", 9
+    client = schema.SchemaClient(*rpc.connection())
+    plan = schema.build_plan(
+        client,
+        args,
+        {
+            "values": {"message_main_attachment_id": 42},
+            "expected": {"message_main_attachment_id": False},
+        },
+    )
+    with pytest.raises(ValueError):
+        schema.apply_plan(client, args, plan)
+    assert (
+        json.loads((tmp_path / "journal.json").read_text(encoding="utf-8"))["status"]
+        == "requires_review"
+    )
+    assert len(rpc.mutations) == (
+        1 if failure in {"readback", "attachment_readback", "chatter"} else 0
+    )
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize("failure", ["no_guard", "create", "batch", "clear", "wrong_relation"])
+def test_primary_attachment_requires_single_existing_target_and_explicit_guard(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    rpc = ScriptedRpc()
+    rpc.queue(
+        "res.partner",
+        "fields_get",
+        {
+            "message_main_attachment_id": {
+                "type": "many2one",
+                "relation": "res.partner" if failure == "wrong_relation" else "ir.attachment",
+            },
+        },
+    )
+    args = arguments(tmp_path)
+    args.command = (
+        "record-create"
+        if failure == "create"
+        else "record-set-batch"
+        if failure == "batch"
+        else "record-set"
+    )
+    args.record_id, args.record_ids = 9, [9]
+    spec: RpcRecord = {
+        "values": {"message_main_attachment_id": False if failure == "clear" else 42}
+    }
+    if failure not in {"create", "no_guard"}:
+        spec["expected"] = {"message_main_attachment_id": False}
+    with pytest.raises(ValueError, match="Primary attachment"):
+        schema.build_plan(schema.SchemaClient(*rpc.connection()), args, spec)
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
 @pytest.mark.parametrize("failure", [None, "missing", "stale", "readback"])
 def test_reference_records_validate_targets_recheck_and_verify(
     tmp_path: Path, failure: str | None
