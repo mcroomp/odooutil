@@ -74,6 +74,7 @@ class RecordPlan(TypedDict):
     audit_chatter: bool
     automation_acknowledged: bool
     side_effect_warning: str
+    primary_attachment: NotRequired[RpcRecord]
 
 
 class AttachmentSource(TypedDict):
@@ -993,8 +994,22 @@ def record_plan(client: RpcClient, args: SchemaArgs, spec: RpcRecord | None) -> 
         names <= fields.keys(), f"Unknown or inaccessible fields: {sorted(names - fields.keys())}"
     )
     normalized: RpcRecord = {}
+    primary_attachment: RpcRecord | None = None
     for name in sorted(names):
         field = fields[name]
+        if name == "message_main_attachment_id":
+            require(
+                args.command == "record-set" and name in values and name in expected,
+                "Primary attachment requires record-set with an explicit expected current value",
+            )
+            require(
+                field["type"] == "many2one" and field.get("relation") == "ir.attachment",
+                "Primary attachment must be a native ir.attachment relation",
+            )
+            require(
+                values[name] is not False,
+                "Primary attachment assignment requires an existing attachment ID",
+            )
         require(
             name
             not in {
@@ -1005,7 +1020,6 @@ def record_plan(client: RpcClient, args: SchemaArgs, spec: RpcRecord | None) -> 
                 "write_date",
                 "message_ids",
                 "message_follower_ids",
-                "message_main_attachment_id",
             },
             f"System/chatter field is not supported: {name}",
         )
@@ -1018,11 +1032,24 @@ def record_plan(client: RpcClient, args: SchemaArgs, spec: RpcRecord | None) -> 
             )
             normalized[name] = record_value(field, values[name])
             if field["type"] == "many2one" and normalized[name] is not False:
-                require(
-                    client.one(text(field["relation"]), [["id", "=", normalized[name]]], ["id"])
-                    is not None,
-                    f"Unknown or inaccessible related record for {name}",
+                related = client.one(
+                    text(field["relation"]),
+                    [["id", "=", normalized[name]]],
+                    ATTACHMENT_COLUMNS if name == "message_main_attachment_id" else ["id"],
                 )
+                if related is None:
+                    raise ValueError(f"Unknown or inaccessible related record for {name}")
+                if name == "message_main_attachment_id":
+                    require(
+                        related["res_model"] == args.model
+                        and type(related["res_id"]) is int
+                        and related["res_id"] == args.record_id
+                        and related["res_field"] is False
+                        and related["public"] is False
+                        and related["type"] == "binary",
+                        "Primary attachment must be a private binary attachment owned by the target record",
+                    )
+                    primary_attachment = related
             if field["type"] == "reference" and normalized[name] is not False:
                 model, identifier = reference_parts(normalized[name])
                 require(
@@ -1047,7 +1074,7 @@ def record_plan(client: RpcClient, args: SchemaArgs, spec: RpcRecord | None) -> 
                 )
         before = records if batch else records[0]
     context = mutation_context(client, args)
-    return {
+    plan: RecordPlan = {
         "action": "create" if creating else "update",
         "kind": "records" if batch else "record",
         "rpc_model": args.model,
@@ -1061,6 +1088,9 @@ def record_plan(client: RpcClient, args: SchemaArgs, spec: RpcRecord | None) -> 
         "automation_acknowledged": args.allow_automation,
         "side_effect_warning": MUTATION_WARNING,
     }
+    if primary_attachment is not None:
+        plan["primary_attachment"] = primary_attachment
+    return plan
 
 
 def chatter_snapshot(
@@ -1374,6 +1404,16 @@ def verify(
             for name, value in values.items():
                 actual = record_value(plan["fields"][name], row[name], reading=True)
                 require(actual == value, f"Saved field value mismatch: {name} (record {row['id']})")
+        if "primary_attachment" in plan:
+            attachment = client.one(
+                "ir.attachment",
+                [["id", "=", plan["primary_attachment"]["id"]]],
+                ATTACHMENT_COLUMNS,
+            )
+            require(
+                attachment == plan["primary_attachment"],
+                "Primary attachment changed during the update; inspect the journal and live state",
+            )
         return records if plan["kind"] == "records" else records[0]
     after = (
         client.field(args.model, args.name)

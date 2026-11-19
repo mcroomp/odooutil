@@ -185,6 +185,34 @@ non-stored, related and system/chatter fields are refused. Dates use YYYY-MM-DD;
 datetimes use YYYY-MM-DD HH:MM:SS in UTC. Use native `false`, not null, to clear
 optional values. `--lang CODE` selects an installed language for record mutations.
 
+#### Primary attachment
+
+`record-set MODEL ID` can explicitly designate an existing private binary
+attachment as the native `message_main_attachment_id`:
+
+```json
+{
+  "values": {"message_main_attachment_id": 42},
+  "expected": {"message_main_attachment_id": false}
+}
+```
+
+An explicit expected primary value is mandatory: use `false` only when no primary
+is set, or the reviewed current attachment ID when intentionally replacing it.
+The attachment must already belong to exactly that model and record, must not be
+public, and must not back a binary field. Foreign, missing and URL attachments are
+refused. The native relation must be writable and stored. Creation, batch
+assignment and clearing the primary are not supported; other system/chatter
+fields remain protected.
+
+Previews and journals include attachment metadata, not content. Apply rechecks
+the target, expected primary and attachment metadata immediately before writing,
+then verifies the saved relation and unchanged attachment metadata. An already
+selected attachment produces a verified no-op. Normal target confirmation,
+exclusive journals, automation checks and quiet chatter audits still apply.
+This only selects an existing attachment; it does not upload, move, publish,
+rename or delete files. Checks are not atomic against concurrent changes.
+
 Writable Reference fields accept `model,positive_id` strings or `false`. The
 model must appear in the field's native selection and the target record must
 exist and be accessible, including at the apply recheck. For example, an
