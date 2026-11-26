@@ -445,6 +445,527 @@ def test_many2one_deletion_refuses_dependent_one2many(tmp_path: Path) -> None:
     rpc.assert_complete()
 
 
+def related_many2one_spec() -> RpcRecord:
+    return {
+        "ttype": "many2one",
+        "field_description": "Owner",
+        "relation": "res.partner",
+        "related": "x_parent_id.x_owner_id",
+        "readonly": True,
+        "store": True,
+        "copied": False,
+        "required": False,
+        "on_delete": "restrict",
+    }
+
+
+def related_many2one_field() -> RpcRecord:
+    return {
+        "id": 2,
+        "name": "x_owner_id",
+        "model": "x_example_item",
+        "state": "manual",
+        **related_many2one_spec(),
+    }
+
+
+def queue_related_many2one_preview(
+    rpc: ScriptedRpc, *, existing: bool = False, target: RpcRecord | None = None
+) -> None:
+    rpc.queue("ir.model", "search_read", [{"id": 1, "state": "manual"}])
+    rpc.queue("ir.model.fields", "search_read", [related_many2one_field()] if existing else [])
+    rpc.queue(
+        "x_example_item",
+        "fields_get",
+        {"x_parent_id": {"type": "many2one", "relation": "x_example_parent"}},
+    )
+    rpc.queue(
+        "x_example_parent",
+        "fields_get",
+        {"x_owner_id": {"type": "many2one", "relation": "res.partner"}}
+        if target is None
+        else target,
+    )
+    if target is None:
+        rpc.queue("ir.model", "search_read", [{"id": 4}])
+
+
+@pytest.mark.parametrize("update", [False, True])
+def test_related_many2one_is_previewed_journaled_and_verified(tmp_path: Path, update: bool) -> None:
+    rpc = ScriptedRpc()
+    queue_related_many2one_preview(rpc, existing=update)
+    queue_related_many2one_preview(rpc, existing=update)
+    rpc.queue("ir.model.fields", "write" if update else "create", True if update else 2)
+    spec: RpcRecord = {"field_description": "Updated owner"} if update else related_many2one_spec()
+    rpc.queue("ir.model.fields", "search_read", [{**related_many2one_field(), **spec}])
+    args = arguments(tmp_path)
+    args.command = "field-update" if update else "field-create"
+    args.model, args.name = "x_example_item", "x_owner_id"
+    client = schema.SchemaClient(*rpc.connection())
+    plan = schema.build_plan(client, args, spec)
+    assert not rpc.mutations
+    journal = schema.apply_plan(client, args, plan)
+    assert journal["status"] == "verified"
+    expected = spec if update else {**spec, "name": args.name, "model_id": 1, "state": "manual"}
+    assert rpc.mutations[0].args == ([[2], expected] if update else [expected])
+    assert len(rpc.mutations) == 1
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"readonly": False},
+        {"store": 0},
+        {"copied": True},
+        {"required": True},
+    ],
+)
+def test_related_many2one_rejects_unsafe_settings(tmp_path: Path, changes: RpcRecord) -> None:
+    rpc = ScriptedRpc()
+    queue_field_preview(rpc)
+    with pytest.raises(ValueError, match="Related fields require"):
+        schema.build_plan(
+            schema.SchemaClient(*rpc.connection()),
+            arguments(tmp_path),
+            {**related_many2one_spec(), **changes},
+        )
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        {},
+        {"x_owner_id": {"type": "char"}},
+        {"x_owner_id": {"type": "many2one", "relation": "res.users"}},
+    ],
+)
+def test_related_many2one_rejects_incompatible_targets(tmp_path: Path, target: RpcRecord) -> None:
+    rpc = ScriptedRpc()
+    queue_related_many2one_preview(rpc, target=target)
+    args = arguments(tmp_path)
+    args.model, args.name = "x_example_item", "x_owner_id"
+    with pytest.raises(ValueError, match=r"related field|Related target"):
+        schema.build_plan(schema.SchemaClient(*rpc.connection()), args, related_many2one_spec())
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"related": "x_other_id.x_owner_id"},
+        {"store": False},
+        {"relation": "res.users"},
+    ],
+)
+def test_related_many2one_refuses_migrations(tmp_path: Path, changes: RpcRecord) -> None:
+    rpc = ScriptedRpc()
+    rpc.queue("ir.model", "search_read", [{"id": 1, "state": "manual"}])
+    rpc.queue("ir.model.fields", "search_read", [related_many2one_field()])
+    args = arguments(tmp_path)
+    args.command, args.model, args.name = "field-update", "x_example_item", "x_owner_id"
+    with pytest.raises(ValueError, match="explicit migration"):
+        schema.build_plan(schema.SchemaClient(*rpc.connection()), args, changes)
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize("failure", ["stale_target", "readback"])
+def test_related_many2one_failure_retains_review_journal(tmp_path: Path, failure: str) -> None:
+    rpc = ScriptedRpc()
+    queue_related_many2one_preview(rpc)
+    queue_related_many2one_preview(
+        rpc,
+        target={"x_owner_id": {"type": "many2one", "relation": "res.users"}}
+        if failure == "stale_target"
+        else None,
+    )
+    if failure == "readback":
+        rpc.queue("ir.model.fields", "create", 2)
+        rpc.queue(
+            "ir.model.fields",
+            "search_read",
+            [{**related_many2one_field(), "related": "x_parent_id.x_other_id"}],
+        )
+    args = arguments(tmp_path)
+    args.model, args.name = "x_example_item", "x_owner_id"
+    client = schema.SchemaClient(*rpc.connection())
+    plan = schema.build_plan(client, args, related_many2one_spec())
+    with pytest.raises(ValueError, match=r"Related target model|Saved setting mismatch: related"):
+        schema.apply_plan(client, args, plan)
+    journal = json.loads((tmp_path / "journal.json").read_text(encoding="utf-8"))
+    assert journal["status"] == "requires_review"
+    assert len(rpc.mutations) == (1 if failure == "readback" else 0)
+    rpc.assert_complete()
+
+
+def currency_field() -> RpcRecord:
+    return {
+        "id": 5,
+        "name": "x_currency_id",
+        "model": "x_example_item",
+        "state": "manual",
+        "ttype": "many2one",
+        "relation": "res.currency",
+    }
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "boolean",
+        "char",
+        "text",
+        "html",
+        "integer",
+        "float",
+        "monetary",
+        "date",
+        "datetime",
+        "binary",
+        "selection",
+        "many2one",
+        "one2many",
+        "many2many",
+    ],
+)
+@pytest.mark.parametrize("stored", [False, True])
+def test_related_field_types_inherit_target_metadata(kind: str, stored: bool) -> None:
+    rpc = ScriptedRpc()
+    spec: RpcRecord = {
+        "ttype": kind,
+        "field_description": "Related value",
+        "related": "x_parent_id.x_source",
+        "readonly": True,
+        "store": stored,
+        "copied": False,
+        "required": False,
+    }
+    target: RpcRecord = {"type": kind}
+    if kind in {"many2one", "one2many", "many2many"}:
+        spec["relation"] = target["relation"] = "res.partner"
+    if kind == "one2many":
+        spec["relation_field"] = target["relation_field"] = "parent_id"
+    if kind == "monetary":
+        spec["currency_field"] = "x_currency_id"
+    if kind == "many2many" and stored:
+        spec.update(
+            {
+                "relation_table": "x_example_related_partner_rel",
+                "column1": "item_id",
+                "column2": "partner_id",
+            }
+        )
+    rpc.queue(
+        "x_example_item",
+        "fields_get",
+        {"x_parent_id": {"type": "many2one", "relation": "x_example_parent"}},
+    )
+    rpc.queue("x_example_parent", "fields_get", {"x_source": target})
+    if kind in {"many2one", "one2many", "many2many"}:
+        rpc.queue("ir.model", "search_read", [{"id": 4}])
+    if kind == "monetary":
+        rpc.queue("ir.model.fields", "search_read", [currency_field()])
+    if kind == "many2many" and stored:
+        rpc.queue("ir.model.fields", "search_read", [])
+    values = schema.field_values(
+        schema.SchemaClient(*rpc.connection()),
+        spec,
+        None,
+        "x_example_item",
+    )
+    assert values == spec
+    assert "selection_ids" not in values
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
+def test_related_field_can_alias_one_field_without_traversal() -> None:
+    rpc = ScriptedRpc()
+    rpc.queue("res.partner", "fields_get", {"name": {"type": "char"}})
+    spec: RpcRecord = {
+        "ttype": "char",
+        "field_description": "Alias",
+        "related": "name",
+        "readonly": True,
+        "store": False,
+        "copied": False,
+        "required": False,
+    }
+    assert (
+        schema.field_values(
+            schema.SchemaClient(*rpc.connection()),
+            spec,
+            None,
+            "res.partner",
+        )
+        == spec
+    )
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize("kind", ["one2many", "many2many"])
+def test_related_paths_cannot_traverse_collections(kind: str) -> None:
+    rpc = ScriptedRpc()
+    rpc.queue(
+        "x_example_item",
+        "fields_get",
+        {"x_parent_id": {"type": kind, "relation": "x_example_parent"}},
+    )
+    with pytest.raises(ValueError, match="only Many2one"):
+        schema.field_values(
+            schema.SchemaClient(*rpc.connection()),
+            related_many2one_spec(),
+            None,
+            "x_example_item",
+        )
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize("kind", ["selection", "one2many", "many2many"])
+def test_related_metadata_overrides_are_refused(kind: str) -> None:
+    rpc = ScriptedRpc()
+    spec: RpcRecord = {
+        "ttype": kind,
+        "field_description": "Alias",
+        "related": "x_source",
+        "readonly": True,
+        "store": False,
+        "copied": False,
+        "required": False,
+    }
+    target: RpcRecord = {"type": kind}
+    if kind in {"one2many", "many2many"}:
+        spec["relation"] = target["relation"] = "res.partner"
+    if kind == "one2many":
+        spec["relation_field"] = "wrong_id"
+        target["relation_field"] = "parent_id"
+    elif kind == "many2many":
+        spec["relation_table"] = "x_unwanted_table"
+    else:
+        spec["selection"] = [["wrong", "Wrong"]]
+    rpc.queue("x_example_item", "fields_get", {"x_source": target})
+    if kind in {"one2many", "many2many"}:
+        rpc.queue("ir.model", "search_read", [{"id": 4}])
+    with pytest.raises(
+        ValueError, match=r"inverse must match|stored many2many|non-related selection"
+    ):
+        schema.field_values(schema.SchemaClient(*rpc.connection()), spec, None, "x_example_item")
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
+def monetary_spec() -> RpcRecord:
+    return {
+        "ttype": "monetary",
+        "field_description": "Amount",
+        "currency_field": "x_currency_id",
+    }
+
+
+def monetary_field() -> RpcRecord:
+    return {
+        "id": 2,
+        "model": "x_example_item",
+        "name": "x_amount",
+        "state": "manual",
+        **monetary_spec(),
+    }
+
+
+def queue_monetary_preview(
+    rpc: ScriptedRpc,
+    *,
+    existing: bool = False,
+    currency: RpcRecord | None = None,
+) -> None:
+    rpc.queue("ir.model", "search_read", [{"id": 1, "state": "manual"}])
+    rpc.queue("ir.model.fields", "search_read", [monetary_field()] if existing else [])
+    rpc.queue(
+        "ir.model.fields", "search_read", [currency_field() if currency is None else currency]
+    )
+
+
+@pytest.mark.parametrize("update", [False, True])
+def test_monetary_currency_binding_is_journaled_and_verified(tmp_path: Path, update: bool) -> None:
+    rpc = ScriptedRpc()
+    queue_monetary_preview(rpc, existing=update)
+    queue_monetary_preview(rpc, existing=update)
+    rpc.queue("ir.model.fields", "write" if update else "create", True if update else 2)
+    spec: RpcRecord = {"field_description": "Updated amount"} if update else monetary_spec()
+    rpc.queue("ir.model.fields", "search_read", [{**monetary_field(), **spec}])
+    args = arguments(tmp_path)
+    args.command = "field-update" if update else "field-create"
+    args.model, args.name = "x_example_item", "x_amount"
+    client = schema.SchemaClient(*rpc.connection())
+    plan = schema.build_plan(client, args, spec)
+    assert not rpc.mutations
+    journal = schema.apply_plan(client, args, plan)
+    assert journal["status"] == "verified"
+    assert len(rpc.mutations) == 1
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize(
+    "currency",
+    [None, {**currency_field(), "ttype": "char"}, {**currency_field(), "relation": "res.partner"}],
+)
+def test_monetary_requires_existing_currency_relation(currency: RpcRecord | None) -> None:
+    rpc = ScriptedRpc()
+    rpc.queue("ir.model.fields", "search_read", [] if currency is None else [currency])
+    with pytest.raises(ValueError, match=r"existing many2one to res\.currency"):
+        schema.field_values(
+            schema.SchemaClient(*rpc.connection()), monetary_spec(), None, "x_example_item"
+        )
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize("name", [None, "", 5, "x_company_id.currency_id"])
+def test_monetary_requires_explicit_local_currency_field(name: object) -> None:
+    rpc = ScriptedRpc()
+    spec = monetary_spec()
+    if name is None:
+        del spec["currency_field"]
+    else:
+        spec["currency_field"] = name
+    with pytest.raises(ValueError, match="currency_field"):
+        schema.field_values(schema.SchemaClient(*rpc.connection()), spec, None, "x_example_item")
+    assert not rpc.calls
+
+
+def test_monetary_currency_binding_cannot_change() -> None:
+    rpc = ScriptedRpc()
+    with pytest.raises(ValueError, match="currency field requires an explicit migration"):
+        schema.field_values(
+            schema.SchemaClient(*rpc.connection()),
+            {"currency_field": "other_currency_id"},
+            monetary_field(),
+            "x_example_item",
+        )
+    assert not rpc.calls
+
+
+@pytest.mark.parametrize("failure", ["stale_currency", "readback"])
+def test_monetary_failures_retain_review_journal(tmp_path: Path, failure: str) -> None:
+    rpc = ScriptedRpc()
+    queue_monetary_preview(rpc)
+    queue_monetary_preview(
+        rpc,
+        currency={**currency_field(), "relation": "res.partner"}
+        if failure == "stale_currency"
+        else None,
+    )
+    if failure == "readback":
+        rpc.queue("ir.model.fields", "create", 2)
+        rpc.queue(
+            "ir.model.fields", "search_read", [{**monetary_field(), "currency_field": "other_id"}]
+        )
+    args = arguments(tmp_path)
+    args.model, args.name = "x_example_item", "x_amount"
+    client = schema.SchemaClient(*rpc.connection())
+    plan = schema.build_plan(client, args, monetary_spec())
+    with pytest.raises(ValueError, match=r"currency_field"):
+        schema.apply_plan(client, args, plan)
+    journal = json.loads((tmp_path / "journal.json").read_text(encoding="utf-8"))
+    assert journal["status"] == "requires_review"
+    assert len(rpc.mutations) == (1 if failure == "readback" else 0)
+    rpc.assert_complete()
+
+
+def test_currency_field_cannot_be_deleted_while_monetary_fields_use_it(tmp_path: Path) -> None:
+    rpc = ScriptedRpc()
+    rpc.queue("ir.model", "search_read", [{"id": 1, "state": "manual"}])
+    rpc.queue("ir.model.fields", "search_read", [currency_field()])
+    rpc.queue("ir.model.fields", "search_read", [monetary_field()])
+    args = arguments(tmp_path)
+    args.command, args.model, args.name = "field-delete", "x_example_item", "x_currency_id"
+    with pytest.raises(ValueError, match="dependent monetary fields"):
+        schema.build_plan(schema.SchemaClient(*rpc.connection()), args, None)
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize("command", ["record-create", "record-set", "record-set-batch"])
+@pytest.mark.parametrize("amount", [0, -12.34, 123.45])
+def test_monetary_record_writes_preserve_amounts(
+    tmp_path: Path,
+    command: str,
+    amount: int | float,
+) -> None:
+    rpc = ScriptedRpc()
+    fields = {
+        "x_amount": {"type": "monetary", "currency_field": "x_currency_id", "store": True},
+        "x_currency_id": {"type": "many2one", "relation": "res.currency", "store": True},
+    }
+    values = {"x_amount": amount, "x_currency_id": 7}
+    before = [{"id": 10, "x_amount": 1.0, "x_currency_id": [7, "Example currency"]}]
+    if command == "record-set-batch":
+        before.append({**before[0], "id": 11})
+    args = arguments(tmp_path)
+    args.command, args.model, args.record_id = command, "x_example_item", 10
+    args.record_ids = [10, 11]
+    for _ in range(2):
+        rpc.queue(args.model, "fields_get", fields)
+        rpc.queue("res.currency", "search_read", [{"id": 7}])
+        if command != "record-create":
+            rpc.queue(args.model, "search_read", before)
+        rpc.queue("ir.module.module", "search_read", [])
+    rpc.queue(
+        args.model,
+        "create" if command == "record-create" else "write",
+        10 if command == "record-create" else True,
+    )
+    rpc.queue(
+        args.model,
+        "search_read",
+        [{**row, **values, "x_currency_id": [7, "Example currency"]} for row in before],
+    )
+    client = schema.SchemaClient(*rpc.connection())
+    spec: RpcRecord = {"values": values}
+    if command != "record-create":
+        spec["expected"] = {"x_amount": 1.0}
+    plan = schema.build_plan(client, args, spec)
+    assert not rpc.mutations
+    journal = schema.apply_plan(client, args, plan)
+    assert journal["status"] == "verified"
+    assert rpc.mutations[0].args[-1] == values
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize("value", [False, True, None, "12.34", float("inf"), float("nan")])
+def test_invalid_monetary_amounts_are_refused(value: object) -> None:
+    with pytest.raises(ValueError):
+        schema.record_value({"type": "monetary"}, value)
+
+
+def test_monetary_readback_rounding_is_not_silently_accepted(tmp_path: Path) -> None:
+    rpc = ScriptedRpc()
+    for _ in range(2):
+        rpc.queue(
+            "x_example_item",
+            "fields_get",
+            {"x_amount": {"type": "monetary", "currency_field": "x_currency_id"}},
+        )
+        rpc.queue("ir.module.module", "search_read", [])
+    rpc.queue("x_example_item", "create", 10)
+    rpc.queue("x_example_item", "search_read", [{"id": 10, "x_amount": 1.24}])
+    args = arguments(tmp_path)
+    args.command, args.model = "record-create", "x_example_item"
+    client = schema.SchemaClient(*rpc.connection())
+    plan = schema.build_plan(client, args, {"values": {"x_amount": 1.235}})
+    with pytest.raises(ValueError, match="Saved field value mismatch"):
+        schema.apply_plan(client, args, plan)
+    journal = json.loads((tmp_path / "journal.json").read_text(encoding="utf-8"))
+    assert journal["status"] == "requires_review"
+    assert len(rpc.mutations) == 1
+    rpc.assert_complete()
+
+
 @pytest.mark.parametrize("failure", ["stale", "lost_response", "readback"])
 def test_failed_schema_writes_retain_review_journal(tmp_path: Path, failure: str) -> None:
     rpc = ScriptedRpc()

@@ -4,6 +4,7 @@ import argparse
 import ast
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -341,6 +342,14 @@ def native_values(
         require(value is not None, f"Use false rather than null: {model}.{name}")
         if kind == "boolean":
             require(type(value) is bool, f"{model}.{name} requires a boolean")
+        elif kind in {"float", "monetary"}:
+            require(
+                isinstance(value, (int, float))
+                and type(value) in (int, float)
+                and abs(value) <= sys.float_info.max
+                and math.isfinite(value),
+                f"{model}.{name} requires a finite number",
+            )
         elif kind in {"integer", "many2one"}:
             require(
                 type(value) is int or (kind == "many2one" and value is False),

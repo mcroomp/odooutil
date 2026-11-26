@@ -23,6 +23,40 @@ def spec() -> RpcRecord:
     }
 
 
+@pytest.mark.parametrize("kind", ["monetary", "float"])
+@pytest.mark.parametrize("amount", [0, -12.34, 123.45])
+def test_report_numeric_settings_preserve_amounts(kind: str, amount: int | float) -> None:
+    rpc = ScriptedRpc()
+    rpc.queue("account.report", "fields_get", {"x_amount": {"type": kind}})
+    values: RpcRecord = {"x_amount": amount}
+    assert (
+        report.native_values(
+            RpcClient(*rpc.connection()),
+            "account.report",
+            values,
+            {},
+        )
+        == values
+    )
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize("amount", [False, True, None, "12.34", float("inf"), float("nan")])
+def test_report_monetary_settings_refuse_invalid_amounts(amount: object) -> None:
+    rpc = ScriptedRpc()
+    rpc.queue("account.report", "fields_get", {"x_amount": {"type": "monetary"}})
+    with pytest.raises(ValueError):
+        report.native_values(
+            RpcClient(*rpc.connection()),
+            "account.report",
+            {"x_amount": amount},
+            {},
+        )
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
 def queue_plan(rpc: ScriptedRpc, *, existing: bool = False) -> None:
     for model, fields in {
         "account.report": {"name": {"type": "char"}},
