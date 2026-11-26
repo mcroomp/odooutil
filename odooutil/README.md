@@ -111,6 +111,87 @@ optionally with an embedded editable list. Schema and view operations are not
 atomic; a failed view change leaves the field in place. This provisions schema
 only: x2many record-value writes remain unsupported by the record commands.
 
+### Related fields
+
+All supported field types may be related, including scalar, selection, monetary,
+Many2one, One2many and Many2many fields. Explicitly choose `store: true` or
+`store: false`; related fields must be read-only, non-copyable and not required
+as inputs:
+
+```json
+{
+  "ttype": "many2one",
+  "field_description": "Owner",
+  "relation": "res.partner",
+  "related": "x_parent_id.x_owner_id",
+  "readonly": true,
+  "store": true,
+  "copied": false,
+  "required": false,
+  "on_delete": "restrict"
+}
+```
+
+The related path must contain 1-8 fields, traverse only Many2one relations,
+and end in the declared type and, for relational fields, related model.
+One2many and Many2many endpoints are allowed, but traversing a collection
+in the middle of a path is refused: related fields do not aggregate collections.
+Preview and pre-write rechecks
+validate every hop; readback verifies the requested settings. Changing an
+existing field's path, storage mode, type, or related model requires an explicit
+migration. Related selection choices come from the target and cannot be
+overridden. Related One2many fields require the target's `relation_field`;
+it points back to the target field's owner, not necessarily the new field's owner.
+Stored Many2many fields require explicit unique `relation_table`, `column1` and
+`column2` settings, even when related. Non-stored related Many2many fields must
+omit those table settings.
+
+### Monetary fields and currencies
+
+Create a currency relation on the amount's model first:
+
+```json
+{
+  "ttype": "many2one",
+  "field_description": "Currency",
+  "relation": "res.currency",
+  "required": true,
+  "on_delete": "restrict"
+}
+```
+
+For example, use it with `field-create x_example_item x_currency_id --spec FILE`.
+Then create the amount with:
+
+```json
+{
+  "ttype": "monetary",
+  "field_description": "Amount",
+  "currency_field": "x_currency_id",
+  "required": true
+}
+```
+
+`currency_field` must explicitly name an existing Many2one to `res.currency` on
+the same model. Standard names such as `currency_id` and custom names are both
+supported; no currency is guessed or created. Related monetary fields also need
+this local currency relation, which can itself be related. Ensure it represents
+the same currency as the source amount. Changing the currency-field binding
+requires an explicit migration; deleting a referenced currency field is refused.
+These checks are repeated before writing and the saved binding is verified.
+
+A monetary value is a JSON number, not a formatted string or an amount/currency
+object. Use record create, update and batch-update commands with the amount and,
+when necessary, an existing currency record ID. Currency records use native
+`res.currency` IDs, not ISO-code strings. Odoo supplies currency precision,
+rounding and display symbols. The utility sends finite numbers unchanged and
+verifies Odoo's readback; it does not convert currencies, fetch exchange rates,
+or silently round to make a mismatch pass. Supply an amount already valid for
+the selected currency. A readback mismatch retains a recovery journal.
+Read-only queries preserve numeric amounts, and default `fields-get` metadata
+includes `currency_field` so consumers can discover the binding. Native report
+specs also accept finite monetary values in writable numeric settings.
+
 An existing `x_name` char field on an empty manual `x_` model can be made a
 stored computed display name with `field-update`. Supply `compute` (reviewed
 Python code), `depends` (comma-separated field paths), `store: true`,

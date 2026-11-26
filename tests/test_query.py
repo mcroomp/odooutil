@@ -42,6 +42,28 @@ def test_query_cli_only_performs_requested_read(
     rpc.assert_complete()
 
 
+def test_monetary_queries_preserve_amounts_and_discover_currency_binding(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rpc = ScriptedRpc()
+    metadata = {"x_amount": {"type": "monetary", "currency_field": "x_currency_id"}}
+    rpc.queue("x_example_item", "fields_get", metadata)
+    query.main(["fields-get", "x_example_item"], connection_provider=rpc.connection)
+    assert json.loads(capsys.readouterr().out) == metadata
+    assert rpc.calls[0].kwargs == {
+        "attributes": ["string", "type", "relation", "required", "readonly", "currency_field"]
+    }
+    amounts = [{"id": 1, "x_amount": -12.34, "x_currency_id": [7, "Example currency"]}]
+    rpc.queue("x_example_item", "search_read", amounts)
+    query.main(
+        ["search-read", "x_example_item", "--fields", "id", "x_amount", "x_currency_id"],
+        connection_provider=rpc.connection,
+    )
+    assert json.loads(capsys.readouterr().out) == amounts
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
 @pytest.mark.parametrize(
     "argv",
     [

@@ -11,7 +11,7 @@ from odoobase import ConnectionProvider, get_odoo_models
 from odoobase.rpc import MODEL_NAME_PATTERN
 
 MAX_ROWS = 1000
-DEFAULT_FIELD_ATTRIBUTES = ["string", "type", "relation", "required", "readonly"]
+DEFAULT_FIELD_ATTRIBUTES = ["string", "type", "relation", "required", "readonly", "currency_field"]
 
 
 class QueryArgs(argparse.Namespace):

@@ -153,6 +153,7 @@ FIELD_TYPES = {
     "boolean",
     "integer",
     "float",
+    "monetary",
     "date",
     "datetime",
     "binary",
@@ -172,6 +173,7 @@ FIELD_KEYS = {
     "copied",
     "relation",
     "relation_field",
+    "currency_field",
     "on_delete",
     "groups",
     "selection",
@@ -198,6 +200,7 @@ FIELD_COLUMNS = [
     "copied",
     "relation",
     "relation_field",
+    "currency_field",
     "on_delete",
     "groups",
     "related",
@@ -294,6 +297,10 @@ def field_values(
             "relation_field" not in spec or spec["relation_field"] == before.get("relation_field"),
             "Changing the inverse field requires an explicit migration",
         )
+        require(
+            "currency_field" not in spec or spec["currency_field"] == before.get("currency_field"),
+            "Changing the currency field requires an explicit migration",
+        )
         for key in ("related", "store"):
             require(
                 key not in spec or spec[key] == before.get(key),
@@ -310,6 +317,7 @@ def field_values(
     require(field_type in FIELD_TYPES, f"Unsupported field type: {field_type}")
     related = spec.get("related", before.get("related") if before else None)
     compute = spec.get("compute", before.get("compute") if before else None)
+    related_target: RpcRecord | None = None
     if compute:
         require(not related, "Computed names cannot also be related fields")
         require(
@@ -343,22 +351,39 @@ def field_values(
                 "Adding a computation to populated models requires an explicit migration",
             )
     elif related:
-        require(field_type == "boolean", "Only related boolean fields are supported")
         effective = {**(before or {}), **spec}
         require(
             effective.get("readonly") is True
-            and effective.get("store") is False
+            and type(effective.get("store")) is bool
             and effective.get("copied") is False
             and effective.get("required") is False,
-            "Related booleans require readonly=true, store=false, copied=false, required=false",
+            "Related fields require readonly=true, explicit boolean store, copied=false, "
+            "required=false",
         )
-        validate_related_boolean(client, model, text(related))
+        related_target = validate_related_field(
+            client,
+            model,
+            text(related),
+            field_type=text(field_type),
+            relation=(
+                text(effective.get("relation"))
+                if field_type in ("many2one", "one2many", "many2many")
+                else None
+            ),
+        )
     else:
         require(
             not {"related", "store", "compute", "depends"} & spec.keys(),
-            "related/store settings require a related boolean field",
+            "related/store settings require a related field",
         )
-    for key in ("field_description", "help", "relation", "relation_field", "on_delete"):
+    for key in (
+        "field_description",
+        "help",
+        "relation",
+        "relation_field",
+        "currency_field",
+        "on_delete",
+    ):
         if key in spec:
             require(isinstance(spec[key], str), f"{key} must be a string")
     if "field_description" in spec:
@@ -393,21 +418,46 @@ def field_values(
             and re.fullmatch(r"[a-z][a-z0-9_]*", inverse_name) is not None,
             "one2many needs a valid relation_field",
         )
-        inverse = client.field(text(relation), text(inverse_name))
-        require(
-            inverse is not None
-            and inverse["ttype"] == "many2one"
-            and inverse["relation"] == model
-            and inverse.get("store") is True
-            and not inverse.get("related")
-            and not inverse.get("compute"),
-            "one2many inverse must be an existing stored, non-related, non-computed "
-            "many2one pointing to the owning model",
-        )
+        if related_target is not None:
+            require(
+                inverse_name == related_target.get("relation_field"),
+                "Related one2many inverse must match the target field",
+            )
+        else:
+            inverse = client.field(text(relation), text(inverse_name))
+            require(
+                inverse is not None
+                and inverse["ttype"] == "many2one"
+                and inverse["relation"] == model
+                and inverse.get("store") is True
+                and not inverse.get("related")
+                and not inverse.get("compute"),
+                "one2many inverse must be an existing stored, non-related, non-computed "
+                "many2one pointing to the owning model",
+            )
     else:
         require("relation_field" not in spec, "relation_field requires one2many")
+    if field_type == "monetary":
+        currency_name = spec.get("currency_field", before.get("currency_field") if before else None)
+        require(
+            isinstance(currency_name, str)
+            and re.fullmatch(r"[a-z][a-z0-9_]*", currency_name) is not None,
+            "monetary needs an explicit valid currency_field",
+        )
+        currency = client.field(model, text(currency_name))
+        require(
+            currency is not None
+            and currency["ttype"] == "many2one"
+            and currency["relation"] == "res.currency",
+            "currency_field must be an existing many2one to res.currency on the owning model",
+        )
+    else:
+        require("currency_field" not in spec, "currency_field requires monetary")
     table_keys = {"relation_table", "column1", "column2"}
-    if field_type == "many2many" and before is None:
+    stored_many2many = field_type == "many2many" and (
+        not related or spec.get("store", before.get("store") if before else None) is True
+    )
+    if stored_many2many and before is None:
         require(
             table_keys <= spec.keys(), "many2many create needs relation_table, column1 and column2"
         )
@@ -425,8 +475,8 @@ def field_values(
             ),
             "Relation table already belongs to another field",
         )
-    elif field_type != "many2many":
-        require(not table_keys & spec.keys(), "Table settings require many2many")
+    elif not stored_many2many:
+        require(not table_keys & spec.keys(), "Table settings require stored many2many")
     values = {key: value for key, value in spec.items() if key not in ("selection", "groups")}
     if "groups" in spec:
         groups = positive_ids(
@@ -440,7 +490,7 @@ def field_values(
         )
         require({integer(r["id"]) for r in existing} == set(groups), "Unknown access group ID")
         values["groups"] = [(6, 0, groups)]
-    if field_type == "selection":
+    if field_type == "selection" and not related:
         require(
             before is not None or "selection" in spec, "Selection create needs selection choices"
         )
@@ -477,7 +527,7 @@ def field_values(
                 for index, (key, label) in enumerate(pairs)
             ]
     else:
-        require("selection" not in spec, "selection choices require a selection field")
+        require("selection" not in spec, "selection choices require a non-related selection field")
     return values
 
 
@@ -509,26 +559,41 @@ def validate_compute_dependencies(client: SchemaClient, model: str, depends: str
                 current_model = text(field["relation"])
 
 
-def validate_related_boolean(client: SchemaClient, model: str, path: str) -> None:
+def validate_related_field(
+    client: SchemaClient,
+    model: str,
+    path: str,
+    *,
+    field_type: str,
+    relation: str | None,
+) -> RpcRecord:
     require(
-        re.fullmatch(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){1,7}", path) is not None,
-        "Related path must contain 2-8 field names",
+        re.fullmatch(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){0,7}", path) is not None,
+        "Related path must contain 1-8 field names",
     )
     parts = path.split(".")
     for index, name in enumerate(parts):
         fields = object_dict(
-            client.call(model, "fields_get", [[name]], attributes=["type", "relation"])
+            client.call(
+                model, "fields_get", [[name]], attributes=["type", "relation", "relation_field"]
+            )
         )
         require(name in fields, f"Unknown or inaccessible related field: {model}.{name}")
         field = object_dict(fields[name])
         if index == len(parts) - 1:
-            require(field["type"] == "boolean", "Related target must be boolean")
-        else:
-            require(
-                field["type"] == "many2one" and bool(field.get("relation")),
-                "Related path must traverse only Many2one fields",
-            )
-            model = text(field["relation"])
+            require(field["type"] == field_type, f"Related target must be {field_type}")
+            if field_type in ("many2one", "one2many", "many2many"):
+                require(
+                    field.get("relation") == relation,
+                    "Related target model must match relation",
+                )
+            return field
+        require(
+            field["type"] == "many2one" and bool(field.get("relation")),
+            "Related path must traverse only Many2one fields",
+        )
+        model = text(field["relation"])
+    raise ValueError("Related path has no target field")
 
 
 def validate_xml(arch: str) -> None:
@@ -1302,6 +1367,21 @@ def build_plan(client: SchemaClient, args: SchemaArgs, spec: RpcRecord | None) -
             raise ValueError(f"{kind} does not exist: {args.name}")
         if kind == "field":
             if before["ttype"] == "many2one":
+                if before["relation"] == "res.currency":
+                    monetary_references = client.search(
+                        "ir.model.fields",
+                        [
+                            ["model", "=", args.model],
+                            ["ttype", "=", "monetary"],
+                            ["currency_field", "=", args.name],
+                        ],
+                        ["id", "model", "name"],
+                        limit=1001,
+                    )
+                    require(
+                        not monetary_references,
+                        f"Remove dependent monetary fields first: {monetary_references}",
+                    )
                 inverse_references = client.search(
                     "ir.model.fields",
                     [
@@ -1474,7 +1554,11 @@ def verify(
         raise ValueError("Saved record was not found")
     expected_id = result if plan["action"] == "create" else object_dict(plan["before"])["id"]
     require(after["id"] == expected_id, "Saved record ID mismatch")
-    if plan["kind"] == "field" and after["ttype"] == "many2many":
+    if (
+        plan["kind"] == "field"
+        and after["ttype"] == "many2many"
+        and (not after.get("related") or after.get("store") is True)
+    ):
         settings = client.one(
             "ir.model.fields",
             [["id", "=", after["id"]]],
