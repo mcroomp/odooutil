@@ -159,6 +159,7 @@ FIELD_TYPES = {
     "selection",
     "many2one",
     "many2many",
+    "one2many",
 }
 
 
@@ -170,6 +171,7 @@ FIELD_KEYS = {
     "readonly",
     "copied",
     "relation",
+    "relation_field",
     "on_delete",
     "groups",
     "selection",
@@ -195,6 +197,7 @@ FIELD_COLUMNS = [
     "readonly",
     "copied",
     "relation",
+    "relation_field",
     "on_delete",
     "groups",
     "related",
@@ -287,6 +290,10 @@ def field_values(
             "relation" not in spec or spec["relation"] == before["relation"],
             "Changing the related model requires an explicit migration",
         )
+        require(
+            "relation_field" not in spec or spec["relation_field"] == before.get("relation_field"),
+            "Changing the inverse field requires an explicit migration",
+        )
         for key in ("related", "store"):
             require(
                 key not in spec or spec[key] == before.get(key),
@@ -351,7 +358,7 @@ def field_values(
             not {"related", "store", "compute", "depends"} & spec.keys(),
             "related/store settings require a related boolean field",
         )
-    for key in ("field_description", "help", "relation", "on_delete"):
+    for key in ("field_description", "help", "relation", "relation_field", "on_delete"):
         if key in spec:
             require(isinstance(spec[key], str), f"{key} must be a string")
     if "field_description" in spec:
@@ -361,8 +368,8 @@ def field_values(
     for key in ("required", "readonly", "copied"):
         if key in spec:
             require(isinstance(spec[key], bool), f"{key} must be boolean")
-    if field_type in ("many2one", "many2many"):
-        relation = spec.get("relation", before["relation"] if before else None)
+    relation = spec.get("relation", before.get("relation") if before else None)
+    if field_type in ("many2one", "many2many", "one2many"):
         require(
             isinstance(relation, str) and MODEL_NAME_PATTERN.fullmatch(relation) is not None,
             "Relational fields need a valid relation",
@@ -379,6 +386,26 @@ def field_values(
             not {"relation", "on_delete"} & spec.keys(),
             "Relation settings require a relational field",
         )
+    if field_type == "one2many":
+        inverse_name = spec.get("relation_field", before.get("relation_field") if before else None)
+        require(
+            isinstance(inverse_name, str)
+            and re.fullmatch(r"[a-z][a-z0-9_]*", inverse_name) is not None,
+            "one2many needs a valid relation_field",
+        )
+        inverse = client.field(text(relation), text(inverse_name))
+        require(
+            inverse is not None
+            and inverse["ttype"] == "many2one"
+            and inverse["relation"] == model
+            and inverse.get("store") is True
+            and not inverse.get("related")
+            and not inverse.get("compute"),
+            "one2many inverse must be an existing stored, non-related, non-computed "
+            "many2one pointing to the owning model",
+        )
+    else:
+        require("relation_field" not in spec, "relation_field requires one2many")
     table_keys = {"relation_table", "column1", "column2"}
     if field_type == "many2many" and before is None:
         require(
@@ -1274,6 +1301,22 @@ def build_plan(client: SchemaClient, args: SchemaArgs, spec: RpcRecord | None) -
         if before is None:
             raise ValueError(f"{kind} does not exist: {args.name}")
         if kind == "field":
+            if before["ttype"] == "many2one":
+                inverse_references = client.search(
+                    "ir.model.fields",
+                    [
+                        ["model", "=", before["relation"]],
+                        ["ttype", "=", "one2many"],
+                        ["relation", "=", args.model],
+                        ["relation_field", "=", args.name],
+                    ],
+                    ["id", "model", "name"],
+                    limit=1001,
+                )
+                require(
+                    not inverse_references,
+                    f"Remove dependent one2many fields first: {inverse_references}",
+                )
             candidates = client.search(
                 "ir.model.fields",
                 [["related", "ilike", args.name]],

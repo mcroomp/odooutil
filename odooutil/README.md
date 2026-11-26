@@ -84,6 +84,33 @@ Field type/relation migrations and removing selection values are refused.
 Deletion requires `--allow-data-loss` and passes dependency checks first.
 Action creation checks code syntax and group access but never executes the action.
 
+### One2many fields
+
+Create the child's Many2one field first, then expose its inverse on the parent:
+
+```json
+{
+  "ttype": "one2many",
+  "field_description": "Items",
+  "relation": "x_example_item",
+  "relation_field": "x_parent_id"
+}
+```
+
+Use this spec with `field-create x_example_parent x_item_ids --spec FILE`.
+The inverse must already be a stored, non-related, non-computed Many2one on
+`x_example_item` pointing to `x_example_parent`. Its name need not start with
+`x_` when using an existing standard-model field. These checks run during
+preview and again before applying; readback verifies the saved inverse name.
+Changing the related model or inverse field requires an explicit migration.
+`on_delete` belongs on the child's Many2one, not the One2many.
+Deleting a Many2one still referenced by a One2many is refused.
+
+After creating the field, add it to a form tab through a separate view operation,
+optionally with an embedded editable list. Schema and view operations are not
+atomic; a failed view change leaves the field in place. This provisions schema
+only: x2many record-value writes remain unsupported by the record commands.
+
 An existing `x_name` char field on an empty manual `x_` model can be made a
 stored computed display name with `field-update`. Supply `compute` (reviewed
 Python code), `depends` (comma-separated field paths), `store: true`,
