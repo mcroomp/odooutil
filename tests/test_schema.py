@@ -264,6 +264,187 @@ def test_field_creation_is_rechecked_journaled_and_verified(tmp_path: Path) -> N
     rpc.assert_complete()
 
 
+def one2many_spec() -> RpcRecord:
+    return {
+        "ttype": "one2many",
+        "field_description": "Items",
+        "relation": "x_example_item",
+        "relation_field": "x_parent_id",
+    }
+
+
+def one2many_field() -> RpcRecord:
+    return {
+        "id": 2,
+        "name": "x_item_ids",
+        "model": "x_example_parent",
+        "state": "manual",
+        **one2many_spec(),
+    }
+
+
+def inverse_field() -> RpcRecord:
+    return {
+        "id": 3,
+        "name": "x_parent_id",
+        "model": "x_example_item",
+        "ttype": "many2one",
+        "relation": "x_example_parent",
+        "store": True,
+        "related": False,
+        "compute": False,
+    }
+
+
+def queue_one2many_preview(
+    rpc: ScriptedRpc, *, inverse: RpcRecord | None, existing: bool = False
+) -> None:
+    rpc.queue(
+        "ir.model", "search_read", [{"id": 1, "model": "x_example_parent", "state": "manual"}]
+    )
+    rpc.queue("ir.model.fields", "search_read", [one2many_field()] if existing else [])
+    rpc.queue("ir.model", "search_read", [{"id": 4}])
+    rpc.queue("ir.model.fields", "search_read", [inverse] if inverse is not None else [])
+
+
+@pytest.mark.parametrize("update", [False, True])
+def test_one2many_is_previewed_journaled_and_verified(tmp_path: Path, update: bool) -> None:
+    rpc = ScriptedRpc()
+    queue_one2many_preview(rpc, inverse=inverse_field(), existing=update)
+    queue_one2many_preview(rpc, inverse=inverse_field(), existing=update)
+    rpc.queue("ir.model.fields", "write" if update else "create", True if update else 2)
+    spec: RpcRecord = {"field_description": "Updated items"} if update else one2many_spec()
+    rpc.queue("ir.model.fields", "search_read", [{**one2many_field(), **spec}])
+    args = arguments(tmp_path)
+    args.command = "field-update" if update else "field-create"
+    args.model, args.name = "x_example_parent", "x_item_ids"
+    client = schema.SchemaClient(*rpc.connection())
+    plan = schema.build_plan(client, args, spec)
+    assert not rpc.mutations
+    journal = schema.apply_plan(client, args, plan)
+    assert journal["status"] == "verified"
+    expected = spec if update else {**spec, "name": args.name, "model_id": 1, "state": "manual"}
+    assert rpc.mutations[0].args == ([[2], expected] if update else [expected])
+    assert len(rpc.mutations) == 1
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize(
+    "inverse",
+    [
+        None,
+        {**inverse_field(), "ttype": "char"},
+        {**inverse_field(), "relation": "res.partner"},
+        {**inverse_field(), "store": False},
+        {**inverse_field(), "related": "x_other_id.x_parent_id"},
+        {**inverse_field(), "compute": "for record in self: pass"},
+    ],
+)
+def test_one2many_rejects_invalid_inverse(tmp_path: Path, inverse: RpcRecord | None) -> None:
+    rpc = ScriptedRpc()
+    queue_one2many_preview(rpc, inverse=inverse)
+    args = arguments(tmp_path)
+    args.model, args.name = "x_example_parent", "x_item_ids"
+    with pytest.raises(ValueError, match="one2many inverse"):
+        schema.build_plan(schema.SchemaClient(*rpc.connection()), args, one2many_spec())
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize("inverse_name", [None, "", 3, "x_parent_id.name"])
+def test_one2many_requires_inverse_name(tmp_path: Path, inverse_name: object) -> None:
+    rpc = ScriptedRpc()
+    rpc.queue("ir.model", "search_read", [{"id": 1, "state": "manual"}])
+    rpc.queue("ir.model.fields", "search_read", [])
+    spec = one2many_spec()
+    if inverse_name is None:
+        del spec["relation_field"]
+    else:
+        spec["relation_field"] = inverse_name
+    if inverse_name is None or isinstance(inverse_name, str):
+        rpc.queue("ir.model", "search_read", [{"id": 4}])
+    args = arguments(tmp_path)
+    args.model, args.name = "x_example_parent", "x_item_ids"
+    with pytest.raises(ValueError, match="relation_field"):
+        schema.build_plan(schema.SchemaClient(*rpc.connection()), args, spec)
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
+def test_one2many_inverse_cannot_change(tmp_path: Path) -> None:
+    rpc = ScriptedRpc()
+    rpc.queue("ir.model", "search_read", [{"id": 1, "state": "manual"}])
+    rpc.queue("ir.model.fields", "search_read", [one2many_field()])
+    args = arguments(tmp_path)
+    args.command, args.model, args.name = "field-update", "x_example_parent", "x_item_ids"
+    with pytest.raises(ValueError, match="inverse field requires an explicit migration"):
+        schema.build_plan(
+            schema.SchemaClient(*rpc.connection()), args, {"relation_field": "x_other_id"}
+        )
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
+@pytest.mark.parametrize("failure", ["stale_inverse", "readback"])
+def test_one2many_failure_retains_review_journal(tmp_path: Path, failure: str) -> None:
+    rpc = ScriptedRpc()
+    queue_one2many_preview(rpc, inverse=inverse_field())
+    queue_one2many_preview(
+        rpc,
+        inverse={**inverse_field(), "relation": "res.partner"}
+        if failure == "stale_inverse"
+        else inverse_field(),
+    )
+    if failure == "readback":
+        rpc.queue("ir.model.fields", "create", 2)
+        rpc.queue(
+            "ir.model.fields", "search_read", [{**one2many_field(), "relation_field": "x_other_id"}]
+        )
+    args = arguments(tmp_path)
+    args.model, args.name = "x_example_parent", "x_item_ids"
+    client = schema.SchemaClient(*rpc.connection())
+    plan = schema.build_plan(client, args, one2many_spec())
+    with pytest.raises(ValueError, match=r"one2many inverse|relation_field"):
+        schema.apply_plan(client, args, plan)
+    journal = json.loads((tmp_path / "journal.json").read_text(encoding="utf-8"))
+    assert journal["status"] == "requires_review"
+    assert len(rpc.mutations) == (1 if failure == "readback" else 0)
+    rpc.assert_complete()
+
+
+def test_relation_field_is_only_allowed_on_one2many(tmp_path: Path) -> None:
+    rpc = ScriptedRpc()
+    queue_field_preview(rpc)
+    args = arguments(tmp_path)
+    with pytest.raises(ValueError, match="relation_field requires one2many"):
+        schema.build_plan(
+            schema.SchemaClient(*rpc.connection()),
+            args,
+            {"ttype": "char", "field_description": "Reference", "relation_field": "x_parent_id"},
+        )
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
+def test_many2one_deletion_refuses_dependent_one2many(tmp_path: Path) -> None:
+    rpc = ScriptedRpc()
+    rpc.queue("ir.model", "search_read", [{"id": 4, "state": "manual"}])
+    rpc.queue("ir.model.fields", "search_read", [{**inverse_field(), "state": "manual"}])
+    rpc.queue("ir.model.fields", "search_read", [one2many_field()])
+    args = arguments(tmp_path)
+    args.command, args.model, args.name = "field-delete", "x_example_item", "x_parent_id"
+    with pytest.raises(ValueError, match="dependent one2many"):
+        schema.build_plan(schema.SchemaClient(*rpc.connection()), args, None)
+    assert rpc.calls[-1].args[0] == [
+        ["model", "=", "x_example_parent"],
+        ["ttype", "=", "one2many"],
+        ["relation", "=", "x_example_item"],
+        ["relation_field", "=", "x_parent_id"],
+    ]
+    assert not rpc.mutations
+    rpc.assert_complete()
+
+
 @pytest.mark.parametrize("failure", ["stale", "lost_response", "readback"])
 def test_failed_schema_writes_retain_review_journal(tmp_path: Path, failure: str) -> None:
     rpc = ScriptedRpc()
