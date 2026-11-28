@@ -1,7 +1,7 @@
 import io
 import json
 import xmlrpc.client
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Literal
 from urllib.request import Request
@@ -182,6 +182,97 @@ def test_malformed_key_files_fail_before_connecting(tmp_path: Path, contents: st
         get_odoo_models(key_file=path)
 
 
+@pytest.mark.parametrize("protocol", ["xmlrpc", "jsonrpc"])
+def test_configured_uid_skips_authentication_and_forwards_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    protocol: Literal["xmlrpc", "jsonrpc"],
+) -> None:
+    path = tmp_path / "credentials"
+    path.write_text(
+        "file-user\nfile-key\nhttps://file.example.test\nfile-db\n23\n", encoding="utf-8"
+    )
+    urls: list[str] = []
+    credentials: list[tuple[str, int, str]] = []
+
+    class Models:
+        def execute_kw(
+            self,
+            db: str,
+            uid: int,
+            password: str,
+            model: str,
+            method: str,
+            args: Sequence[object],
+            kwargs: Mapping[str, object] | None = None,
+        ) -> object:
+            credentials.append((db, uid, password))
+            assert (model, method, args) == ("res.partner", "search_count", [[]])
+            return 3
+
+    def proxy(url: str, **kwargs: object) -> Models:
+        urls.append(url)
+        return Models()
+
+    def urlopen(request: Request, *, timeout: float) -> io.BytesIO:
+        assert isinstance(request.data, bytes)
+        payload = record_dict(json.loads(request.data))
+        params = record_dict(payload["params"])
+        assert params == {
+            "service": "object",
+            "method": "execute_kw",
+            "args": ["file-db", 23, "file-key", "res.partner", "search_count", [[]], {}],
+        }
+        return io.BytesIO(json.dumps({"id": payload["id"], "result": 3}).encode())
+
+    monkeypatch.setattr(xmlrpc.client, "ServerProxy", proxy)
+    monkeypatch.setattr(transport, "urlopen", urlopen)
+    models, db, uid, password = get_odoo_models(key_file=path, rpc_protocol=protocol)
+    assert (db, uid, password) == ("file-db", 23, "file-key")
+    assert models.execute_kw(db, uid, password, "res.partner", "search_count", [[]]) == 3
+    if protocol == "xmlrpc":
+        assert urls == ["https://file.example.test/xmlrpc/2/object"]
+        assert credentials == [("file-db", 23, "file-key")]
+    else:
+        assert urls == []
+
+
+@pytest.mark.parametrize("uid_text", ["0", "-1", "True", "1.5", "+17", "\u0661", "17\nextra"])
+def test_invalid_configured_uid_fails_before_connecting(tmp_path: Path, uid_text: str) -> None:
+    path = tmp_path / "credentials"
+    path.write_text(
+        f"file-user\nfile-key\nhttps://file.example.test\nfile-db\n{uid_text}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="user ID"):
+        get_odoo_models(key_file=path)
+
+
+@pytest.mark.parametrize(
+    "target_url,target_db",
+    [
+        ("https://clone.example.test", "clone"),
+        ("https://file.example.test", "file-db"),
+    ],
+)
+def test_target_override_authenticates_instead_of_using_configured_uid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, target_url: str, target_db: str
+) -> None:
+    path = tmp_path / "credentials"
+    path.write_text(
+        "file-user\nfile-key\nhttps://file.example.test\nfile-db\n23\n", encoding="utf-8"
+    )
+    auth = Authentication(17)
+
+    def proxy(url: str, **kwargs: object) -> Authentication:
+        return auth
+
+    monkeypatch.setattr(xmlrpc.client, "ServerProxy", proxy)
+    _, db, uid, _ = get_odoo_models(key_file=path, target_url=target_url, target_db=target_db)
+    assert (db, uid) == (target_db, 17)
+    assert auth.calls == [(target_db, "file-user", "file-key")]
+
+
 @pytest.mark.parametrize("uid", [False, True, "17", -1, None])
 def test_invalid_authentication_never_yields_a_connection(
     monkeypatch: pytest.MonkeyPatch, uid: object
@@ -200,8 +291,17 @@ def test_invalid_authentication_never_yields_a_connection(
 @pytest.mark.parametrize(
     "mode", ["null", "fault", "wrong_id", "missing_result", "bad_envelope", "bad_error"]
 )
-def test_jsonrpc_null_and_malformed_envelopes(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+@pytest.mark.parametrize("configured_uid", [False, True])
+def test_jsonrpc_null_and_malformed_envelopes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str, configured_uid: bool
+) -> None:
     configure_environment(monkeypatch)
+    key_file = None
+    if configured_uid:
+        key_file = tmp_path / "credentials"
+        key_file.write_text(
+            "test-user\ntest-key\nhttps://example.test\nexample\n17\n", encoding="utf-8"
+        )
 
     def urlopen(request: Request, *, timeout: float) -> io.BytesIO:
         assert timeout == 60
@@ -223,7 +323,7 @@ def test_jsonrpc_null_and_malformed_envelopes(monkeypatch: pytest.MonkeyPatch, m
         return io.BytesIO(json.dumps(response).encode())
 
     monkeypatch.setattr(transport, "urlopen", urlopen)
-    models, db, uid, password = get_odoo_models(rpc_protocol="jsonrpc")
+    models, db, uid, password = get_odoo_models(key_file=key_file, rpc_protocol="jsonrpc")
     if mode == "null":
         assert models.execute_kw(db, uid, password, "account.report", "get_options", []) is None
     else:
