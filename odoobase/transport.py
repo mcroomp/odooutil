@@ -172,17 +172,26 @@ def get_odoo_models(
     password = os.environ.get("ODOO_API_KEY")
     odoo_url = os.environ.get("ODOO_URL")
     db = os.environ.get("ODOO_DB")
+    configured_uid: int | None = None
 
     if key_file is not None:
         try:
             lines = key_file.read_text(encoding="utf-8").strip().splitlines()
         except (OSError, UnicodeError) as exc:
             raise RuntimeError("Cannot read the explicit Odoo credential file") from exc
-        if len(lines) != 4 or not all(line.strip() for line in lines):
+        if len(lines) not in (4, 5) or not all(line.strip() for line in lines):
             raise ValueError(
-                "Odoo credential file needs four nonempty lines: user, key, URL, database"
+                "Odoo credential file needs four nonempty lines: user, key, URL, database; "
+                "optionally followed by a positive integer user ID"
             )
-        username, password, odoo_url, db = (line.strip() for line in lines)
+        username, password, odoo_url, db = (line.strip() for line in lines[:4])
+        if len(lines) == 5:
+            uid_text = lines[4].strip()
+            if not uid_text.isascii() or not uid_text.isdecimal():
+                raise ValueError("Odoo credential file user ID must be a positive integer")
+            configured_uid = int(uid_text)
+            if configured_uid <= 0:
+                raise ValueError("Odoo credential file user ID must be a positive integer")
     if not all((username, password, odoo_url, db)):
         raise RuntimeError(
             "Set ODOO_USERNAME, ODOO_API_KEY, ODOO_URL and ODOO_DB, or provide an explicit key_file"
@@ -191,6 +200,7 @@ def get_odoo_models(
         raise ValueError("target_url and target_db must be provided together")
     if target_url is not None:
         odoo_url = target_url.rstrip("/")
+        configured_uid = None
     if target_db is not None:
         db = target_db
     if username is None or password is None or odoo_url is None or db is None:
@@ -213,21 +223,23 @@ def get_odoo_models(
 
     credential_source = "key_file" if key_file is not None else "environment"
     host = urlsplit(str(odoo_url)).hostname or "unknown"
-    common = (
-        _JsonRpcService(odoo_url, "common")
-        if rpc_protocol == "jsonrpc"
-        else cast(_RpcCommon, xmlrpc.client.ServerProxy(f"{odoo_url}/xmlrpc/2/common"))
-    )
-    try:
-        uid = common.authenticate(db, username, password, {})
-    except Exception:
-        logger.exception(
-            "odoo_authentication_error host=%s database=%s credential_source=%s",
-            host,
-            db,
-            credential_source,
+    uid: object = configured_uid
+    if configured_uid is None:
+        common = (
+            _JsonRpcService(odoo_url, "common")
+            if rpc_protocol == "jsonrpc"
+            else cast(_RpcCommon, xmlrpc.client.ServerProxy(f"{odoo_url}/xmlrpc/2/common"))
         )
-        raise
+        try:
+            uid = common.authenticate(db, username, password, {})
+        except Exception:
+            logger.exception(
+                "odoo_authentication_error host=%s database=%s credential_source=%s",
+                host,
+                db,
+                credential_source,
+            )
+            raise
     if not uid:
         logger.error(
             "odoo_authentication_rejected host=%s database=%s credential_source=%s",
@@ -239,7 +251,8 @@ def get_odoo_models(
     if not isinstance(uid, int) or isinstance(uid, bool) or uid <= 0:
         raise ValueError("Odoo authentication returned an invalid user ID")
     logger.info(
-        "odoo_authenticated host=%s database=%s uid=%s credential_source=%s",
+        "%s host=%s database=%s uid=%s credential_source=%s",
+        "odoo_authenticated" if configured_uid is None else "odoo_uid_configured",
         host,
         db,
         uid,

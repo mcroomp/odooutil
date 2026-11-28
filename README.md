@@ -40,6 +40,12 @@ type-checking imports. The base must never depend on the utilities.
 Set `ODOO_USERNAME`, `ODOO_API_KEY`, `ODOO_URL` and `ODOO_DB` outside source
 control. The URL must be an HTTPS origin. Alternatively pass `--key-file FILE`:
 four nonempty UTF-8 lines containing username, API key, URL and database.
+An optional fifth line can supply the user's positive integer `res.users` ID,
+skipping the initial `authenticate` call. Every subsequent RPC still sends the
+API key for server-side validation; constructing this client does not verify
+the supplied ID or credentials. Four-line files continue to authenticate normally.
+Any explicit target URL/database override ignores the configured ID and
+authenticates against that target, even if it matches the file's target.
 An explicit file takes precedence over environment credentials. Credential files
 are not discovered automatically.
 
